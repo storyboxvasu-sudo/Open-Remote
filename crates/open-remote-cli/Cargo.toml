@@ -1,0 +1,13 @@
+[package]
+name = "open-remote-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+app-common = { path = "../app-common" }
+core-capture = { path = "../core-capture" }
+core-codec = { path = "../core-codec" }
+core-input = { path = "../core-input" }
+core-net = { path = "../core-net" }
+tokio = { version = "1.43", features = ["full"] }
+clap = { version = "4.5", features = ["derive"] }

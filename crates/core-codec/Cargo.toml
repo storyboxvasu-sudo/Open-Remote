@@ -1,0 +1,10 @@
+[package]
+name = "core-codec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+app-common = { path = "../app-common" }
+core-capture = { path = "../core-capture" }
+thiserror = "2.0"
+lz4_flex = "0.11"

@@ -1,0 +1,37 @@
+[package]
+name = "open-remote-gui"
+version = "0.1.0"
+description = "High-Performance Cross-Platform Remote Desktop GUI"
+edition = "2021"
+
+[lib]
+name = "open_remote_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+base64 = "0.22"
+local-ip-address = "0.6"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+
+# Workspace core dependencies
+app-common = { path = "../../crates/app-common" }
+core-capture = { path = "../../crates/core-capture" }
+core-codec = { path = "../../crates/core-codec" }
+core-input = { path = "../../crates/core-input" }
+core-net = { path = "../../crates/core-net" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

@@ -1,0 +1,19 @@
+[env]
+CC = "clang-cl"
+CXX = "clang-cl"
+AR = "llvm-lib"
+RC = "C:\\Users\\Mehul\\.cargo\\bin\\rc.exe"
+RC_x86_64_pc_windows_msvc = "C:\\Users\\Mehul\\.cargo\\bin\\rc.exe"
+INCLUDE = "C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\crt\\include;C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\sdk\\include\\ucrt;C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\sdk\\include\\um;C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\sdk\\include\\shared"
+LIB = "C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\crt\\lib\\x86_64;C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\sdk\\lib\\um\\x86_64;C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\sdk\\lib\\ucrt\\x86_64"
+
+[build]
+rustflags = ["-C", "linker=rust-lld"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-L", "native=C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\crt\\lib\\x86_64",
+    "-L", "native=C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\sdk\\lib\\um\\x86_64",
+    "-L", "native=C:\\Users\\Mehul\\AppData\\Local\\cargo-xwin\\xwin\\sdk\\lib\\ucrt\\x86_64"
+]

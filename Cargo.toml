@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/app-common",
+    "crates/core-capture",
+    "crates/core-codec",
+    "crates/core-input",
+    "crates/core-net",
+    "crates/open-remote-cli",
+    "app-ui/src-tauri",
+]
+

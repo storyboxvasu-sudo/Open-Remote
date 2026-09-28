@@ -1,0 +1,11 @@
+[package]
+name = "core-capture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+app-common = { path = "../app-common" }
+thiserror = "2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-capture = "2.0.1"
