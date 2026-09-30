@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Host { port } => {
-            let id = PeerId::generate();
+            let id = PeerId::load_or_create();
             println!("=====================================================");
             println!("       OPENREMOTE HOST DAEMON ACTIVE                ");
             println!("=====================================================");
@@ -55,11 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let capturer = Arc::new(ScreenCapturer::new()?);
             println!("[Host] Primary display captured: {}x{}", capturer.width, capturer.height);
 
-            let host = DirectLanHost::new(port);
+            let host = DirectLanHost::new(port, Arc::clone(&capturer));
             host.start_input_listener().await?;
             println!("[Host] Direct UDP input listener active on 0.0.0.0:{}", port);
 
-            host.start_video_stream(capturer).await?;
+            host.start_video_stream().await?;
             println!("[Host] Direct TCP video stream broadcaster active on 0.0.0.0:{}", port + 1);
 
             println!("\n[Host] Daemon fully active. Press Ctrl+C to stop.");
@@ -81,15 +81,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for i in 1..=frames {
                 let f_start = std::time::Instant::now();
-                let raw = capturer.next_frame_blocking()?;
+                let mut raw_opt = None;
+                for _ in 0..100 {
+                    if let Some(f) = capturer.get_latest_frame() {
+                        raw_opt = Some(f);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let raw = raw_opt.expect("frame captured");
                 let cap_dur = f_start.elapsed();
 
                 let enc_start = std::time::Instant::now();
-                let compressed = encoder.encode(&raw)?;
+                let compressed_opt = encoder.encode(&raw)?;
                 let enc_dur = enc_start.elapsed();
 
                 total_raw_bytes += raw.data.len();
-                total_compressed_bytes += compressed.payload.len();
+                let comp_len = if let Some(ref c) = compressed_opt { c.payload.len() } else { 0 };
+                total_compressed_bytes += comp_len;
 
                 println!(
                     " Frame {:02}: {}x{} | Cap: {:>6.2?} | LZ4: {:>6.2?} | Raw: {:>5.2}MB -> Comp: {:>5.2}MB (Ratio: {:.1}x)",
@@ -99,8 +108,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cap_dur,
                     enc_dur,
                     raw.data.len() as f64 / (1024.0 * 1024.0),
-                    compressed.payload.len() as f64 / (1024.0 * 1024.0),
-                    raw.data.len() as f64 / compressed.payload.len() as f64
+                    comp_len as f64 / (1024.0 * 1024.0),
+                    if comp_len > 0 { raw.data.len() as f64 / comp_len as f64 } else { 0.0 }
                 );
 
                 tokio::time::sleep(Duration::from_millis(16)).await;

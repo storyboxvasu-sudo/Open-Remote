@@ -1,17 +1,222 @@
 use serde::{Deserialize, Serialize};
 
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentSession {
+    pub peer_id: String,
+    pub alias: Option<String>,
+    pub last_connected_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorDescriptor {
+    pub index: usize,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHandshake {
+    pub host_peer_id: String,
+    pub monitors: Vec<MonitorDescriptor>,
+    pub active_monitor_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConfig {
+    pub peer_id: String,
+    #[serde(default)]
+    pub machine_guid: Option<String>,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub recent_sessions: Vec<RecentSession>,
+}
+
+impl PeerConfig {
+    pub fn load() -> Self {
+        let path = PeerId::config_path();
+        if path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                if let Ok(cfg) = serde_json::from_str::<PeerConfig>(&data) {
+                    return cfg;
+                }
+            }
+        }
+        let peer_id = PeerId::load_or_create();
+        PeerConfig {
+            peer_id: peer_id.0,
+            machine_guid: PeerId::get_machine_guid(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            recent_sessions: Vec::new(),
+        }
+    }
+
+    pub fn save(&self) -> Result<(), std::io::Error> {
+        let path = PeerId::config_path();
+        let dir = PeerId::config_dir();
+        std::fs::create_dir_all(&dir)?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&path, json)
+    }
+
+    pub fn add_recent(&mut self, peer_id: &str, alias: Option<String>) {
+        let clean_id = peer_id.trim();
+        if clean_id.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Remove if exists
+        self.recent_sessions.retain(|s| s.peer_id != clean_id);
+
+        // Prepend as most recent
+        self.recent_sessions.insert(
+            0,
+            RecentSession {
+                peer_id: clean_id.to_string(),
+                alias,
+                last_connected_at: now,
+            },
+        );
+
+        // Limit to max 20 recent sessions
+        if self.recent_sessions.len() > 20 {
+            self.recent_sessions.truncate(20);
+        }
+
+        let _ = self.save();
+    }
+
+    pub fn remove_recent(&mut self, peer_id: &str) {
+        let clean_id = peer_id.trim();
+        self.recent_sessions.retain(|s| s.peer_id != clean_id);
+        let _ = self.save();
+    }
+}
+
 /// Unique 9-digit peer identification
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeerId(pub String);
 
 impl PeerId {
+    /// Generates a random 9-digit Peer ID in format XXX-XXX-XXX
     pub fn generate() -> Self {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         let num: u32 = rng.gen_range(100_000_000..999_999_999);
         Self(format!("{}-{}-{}", &num.to_string()[0..3], &num.to_string()[3..6], &num.to_string()[6..9]))
     }
+
+    /// Derives a deterministic 9-digit ID from a unique machine identifier (e.g., MachineGuid)
+    pub fn derive_from_hardware(seed: &str) -> Self {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &byte in seed.as_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let num = 100_000_000 + (hash % 900_000_000);
+        let s = format!("{:09}", num);
+        Self(format!("{}-{}-{}", &s[0..3], &s[3..6], &s[6..9]))
+    }
+
+    /// Returns the persistent configuration directory for OpenRemote
+    pub fn config_dir() -> PathBuf {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            PathBuf::from(local_app_data).join("open-remote")
+        } else if let Ok(app_data) = std::env::var("APPDATA") {
+            PathBuf::from(app_data).join("open-remote")
+        } else if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            PathBuf::from(user_profile).join("AppData").join("Local").join("open-remote")
+        } else if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(".config").join("open-remote")
+        } else {
+            PathBuf::from(".").join(".open-remote")
+        }
+    }
+
+    /// Returns the full path to config.json
+    pub fn config_path() -> PathBuf {
+        Self::config_dir().join("config.json")
+    }
+
+    /// Reads MachineGuid from the Windows registry if available
+    #[cfg(windows)]
+    pub fn get_machine_guid() -> Option<String> {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let crypto = hklm.open_subkey("SOFTWARE\\Microsoft\\Cryptography").ok()?;
+        let guid: String = crypto.get_value("MachineGuid").ok()?;
+        if guid.trim().is_empty() {
+            None
+        } else {
+            Some(guid)
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn get_machine_guid() -> Option<String> {
+        None
+    }
+
+    /// Loads the permanent Peer ID from local storage, or generates and persists a new one
+    pub fn load_or_create() -> Self {
+        let path = Self::config_path();
+
+        // 1. Attempt to load existing config
+        if path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                if let Ok(config) = serde_json::from_str::<PeerConfig>(&data) {
+                    if !config.peer_id.trim().is_empty() {
+                        return Self(config.peer_id);
+                    }
+                }
+            }
+        }
+
+        // 2. Generate permanent ID (prefer deterministic hardware GUID, fallback to random)
+        let guid = Self::get_machine_guid();
+        let peer_id = match &guid {
+            Some(hardware_id) => Self::derive_from_hardware(hardware_id),
+            None => Self::generate(),
+        };
+
+        // 3. Persist to disk
+        let config = PeerConfig {
+            peer_id: peer_id.0.clone(),
+            machine_guid: guid,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            recent_sessions: Vec::new(),
+        };
+
+        let dir = Self::config_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(json) = serde_json::to_string_pretty(&config) {
+            let _ = std::fs::write(&path, json);
+        }
+
+        peer_id
+    }
 }
+
 
 /// Remote control input messages sent over WebRTC DataChannel / Direct UDP
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +253,9 @@ pub enum InputEvent {
     ClipboardSync {
         text: String,
     },
+    SwitchMonitor {
+        monitor_index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,13 +265,24 @@ pub enum MouseButton {
     Right,
 }
 
-/// Video frame descriptor
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameMeta {
     pub width: u32,
     pub height: u32,
     pub timestamp_ms: u64,
     pub is_keyframe: bool,
+    #[serde(default)]
+    pub dirty_x: u32,
+    #[serde(default)]
+    pub dirty_y: u32,
+    #[serde(default)]
+    pub dirty_w: u32,
+    #[serde(default)]
+    pub dirty_h: u32,
+    #[serde(default)]
+    pub monitors: Option<Vec<MonitorDescriptor>>,
+    #[serde(default)]
+    pub active_monitor: Option<usize>,
 }
 
 /// Signaling protocol envelope
@@ -77,4 +296,32 @@ pub enum SignalingMessage {
     Candidate { target: String, candidate: String },
     Ping,
     Pong,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_peer_id_deterministic_from_hardware() {
+        let guid = "23c35349-e58f-4cc5-8e6b-4694f3eadce7";
+        let id1 = PeerId::derive_from_hardware(guid);
+        let id2 = PeerId::derive_from_hardware(guid);
+        assert_eq!(id1, id2);
+        assert_eq!(id1.0.len(), 11); // 9 digits + 2 hyphens = 11 chars
+        assert_eq!(&id1.0[3..4], "-");
+        assert_eq!(&id1.0[7..8], "-");
+    }
+
+    #[test]
+    fn test_peer_id_load_or_create() {
+        let peer_id = PeerId::load_or_create();
+        assert_eq!(peer_id.0.len(), 11);
+        let path = PeerId::config_path();
+        assert!(path.exists(), "Config file must exist after load_or_create");
+
+        // Subsequent call must return identical peer_id
+        let peer_id2 = PeerId::load_or_create();
+        assert_eq!(peer_id, peer_id2);
+    }
 }

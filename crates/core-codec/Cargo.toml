@@ -8,3 +8,4 @@ app-common = { path = "../app-common" }
 core-capture = { path = "../core-capture" }
 thiserror = "2.0"
 lz4_flex = "0.11"
+parking_lot = "0.12"

@@ -106,6 +106,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "winreg",
 ]
 
 [[package]]
@@ -613,8 +614,11 @@ name = "core-capture"
 version = "0.1.0"
 dependencies = [
  "app-common",
+ "parking_lot",
+ "serde",
  "thiserror 2.0.20",
  "windows-capture",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -624,6 +628,7 @@ dependencies = [
  "app-common",
  "core-capture",
  "lz4_flex",
+ "parking_lot",
  "thiserror 2.0.20",
 ]
 
@@ -686,8 +691,11 @@ dependencies = [
  "core-codec",
  "core-input",
  "futures-util",
+ "local-ip-address",
+ "parking_lot",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite",
@@ -2697,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "open-remote-gui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "app-common",
  "base64 0.22.1",
@@ -2714,6 +2722,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tokio",
  "tokio-tungstenite",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

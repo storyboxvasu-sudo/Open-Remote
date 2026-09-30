@@ -6,6 +6,13 @@ edition = "2021"
 [dependencies]
 app-common = { path = "../app-common" }
 thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+parking_lot = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 windows-capture = "2.0.1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+] }

@@ -1,6 +1,6 @@
 [package]
 name = "open-remote-gui"
-version = "0.1.0"
+version = "1.0.0"
 description = "High-Performance Cross-Platform Remote Desktop GUI"
 edition = "2021"
 
@@ -12,7 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,6 +28,12 @@ core-capture = { path = "../../crates/core-capture" }
 core-codec = { path = "../../crates/core-codec" }
 core-input = { path = "../../crates/core-input" }
 core-net = { path = "../../crates/core-net" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+] }
 
 [profile.release]
 codegen-units = 1
