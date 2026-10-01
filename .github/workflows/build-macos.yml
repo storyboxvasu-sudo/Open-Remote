@@ -122,7 +122,7 @@ jobs:
         run: |
           mkdir -p artifacts
 
-          # 1. Collect Standalone DMG
+          # Collect Standalone DMG
           DMG_FILE=$(find target/${{ matrix.target }}/release/bundle/dmg -name "*.dmg" 2>/dev/null | head -n 1)
           if [ -z "$DMG_FILE" ]; then
             DMG_FILE=$(find target/release/bundle/dmg -name "*.dmg" 2>/dev/null | head -n 1)
@@ -134,31 +134,9 @@ jobs:
           if [ -n "$DMG_FILE" ]; then
             cp "$DMG_FILE" "artifacts/${{ matrix.dmg_name }}"
             echo "DMG created at: artifacts/${{ matrix.dmg_name }}"
-          fi
-
-          # 2. Collect Updater Bundle (.app.tar.gz and .sig)
-          TAR_FILE=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app.tar.gz" 2>/dev/null | head -n 1)
-          if [ -z "$TAR_FILE" ]; then
-            TAR_FILE=$(find target/release/bundle/macos -name "*.app.tar.gz" 2>/dev/null | head -n 1)
-          fi
-          SIG_FILE=$(find target/${{ matrix.target }}/release/bundle/macos -name "*.app.tar.gz.sig" 2>/dev/null | head -n 1)
-          if [ -z "$SIG_FILE" ]; then
-            SIG_FILE=$(find target/release/bundle/macos -name "*.app.tar.gz.sig" 2>/dev/null | head -n 1)
-          fi
-
-          if [ -n "$TAR_FILE" ] && [ -n "$SIG_FILE" ]; then
-            cp "$TAR_FILE" "artifacts/${{ matrix.tar_name }}"
-            cp "$SIG_FILE" "artifacts/${{ matrix.tar_name }}.sig"
-            echo "Updater archive: artifacts/${{ matrix.tar_name }}"
-            echo "Updater signature: artifacts/${{ matrix.tar_name }}.sig"
-
-            # 3. Generate / Update latest.json
-            node scripts/update-latest-json.js \
-              "${{ matrix.platform_key }}" \
-              "artifacts/${{ matrix.tar_name }}.sig" \
-              "${{ matrix.tar_name }}"
           else
-            echo "Notice: Updater artifacts not generated (check if TAURI_PRIVATE_KEY is configured)."
+            echo "Error: DMG file not found!"
+            exit 1
           fi
 
           echo "=== Artifacts Directory Contents ==="
@@ -168,13 +146,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.dmg_name }}
-          path: artifacts/*
+          path: artifacts/${{ matrix.dmg_name }}
           if-no-files-found: error
 
       - name: Publish to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: artifacts/${{ matrix.dmg_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

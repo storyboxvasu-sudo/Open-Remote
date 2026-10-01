@@ -65,6 +65,9 @@ jobs:
           if ($setupExe) {
             Copy-Item $setupExe.FullName "artifacts/OpenRemote-Windows-x64-Setup.exe"
             Write-Host "Collected Setup: artifacts/OpenRemote-Windows-x64-Setup.exe"
+          } else {
+            Write-Error "Setup.exe not found!"
+            exit 1
           }
 
           # 2. Collect MSI Installer (.msi)
@@ -72,32 +75,9 @@ jobs:
           if ($msi) {
             Copy-Item $msi.FullName "artifacts/OpenRemote-Windows-x64.msi"
             Write-Host "Collected MSI: artifacts/OpenRemote-Windows-x64.msi"
-          }
-
-          # 3. Collect Updater Bundle (.nsis.zip or .zip) and signature (.sig)
-          $zip = Get-ChildItem -Path target -Recurse -Filter "*.nsis.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $zip) {
-            $zip = Get-ChildItem -Path target -Recurse -Filter "*.zip" -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*updater*" -or $_.Name -like "*setup*" } | Select-Object -First 1
-          }
-
-          $sig = Get-ChildItem -Path target -Recurse -Filter "*.nsis.zip.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $sig) {
-            $sig = Get-ChildItem -Path target -Recurse -Filter "*.zip.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
-
-          if ($zip -and $sig) {
-            Copy-Item $zip.FullName "artifacts/OpenRemote-Windows-x64.nsis.zip"
-            Copy-Item $sig.FullName "artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
-            Write-Host "Collected Update Archive: artifacts/OpenRemote-Windows-x64.nsis.zip"
-            Write-Host "Collected Signature: artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
-
-            # 4. Generate / Update latest.json
-            node scripts/update-latest-json.js `
-              windows-x86_64 `
-              "artifacts/OpenRemote-Windows-x64.nsis.zip.sig" `
-              "OpenRemote-Windows-x64.nsis.zip"
           } else {
-            Write-Host "Notice: Updater bundle not generated (check if TAURI_PRIVATE_KEY secret is configured)."
+            Write-Error "MSI installer not found!"
+            exit 1
           }
 
           Write-Host "=== Artifacts Directory Contents ==="
@@ -107,13 +87,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: OpenRemote-Windows-x64
-          path: artifacts/*
+          path: |
+            artifacts/OpenRemote-Windows-x64-Setup.exe
+            artifacts/OpenRemote-Windows-x64.msi
           if-no-files-found: error
 
       - name: Publish to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: |
+            artifacts/OpenRemote-Windows-x64-Setup.exe
+            artifacts/OpenRemote-Windows-x64.msi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
