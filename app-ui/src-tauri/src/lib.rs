@@ -614,6 +614,11 @@ async fn app_exit_completely(app: tauri::AppHandle, state: State<'_, AppEngineSt
 }
 
 #[tauri::command]
+fn app_relaunch(app: tauri::AppHandle) {
+    app.restart();
+}
+
+#[tauri::command]
 fn app_start_dragging(#[allow(unused_variables)] window: tauri::Window) {
     #[cfg(desktop)]
     let _ = window.start_dragging();
@@ -674,6 +679,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(app_state)
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             #[cfg(target_os = "windows")]
             {
@@ -802,6 +808,7 @@ pub fn run() {
             app_toggle_maximize,
             app_close,
             app_exit_completely,
+            app_relaunch,
             app_start_dragging
         ])
         .run(tauri::generate_context!())

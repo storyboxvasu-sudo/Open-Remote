@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { check, type Update } from "@tauri-apps/plugin-updater";
 
   type AccessLevel = "ViewOnly" | "Standard" | "FullAccess";
 
@@ -125,6 +126,80 @@
   let clientAccessLevel = $state<AccessLevel>("Standard");
   let unlistenIncoming: UnlistenFn | null = null;
   let unlistenSession: UnlistenFn | null = null;
+
+  // Auto-Updater State
+  let availableUpdate = $state<Update | null>(null);
+  let isCheckingUpdate = $state(false);
+  let isDownloadingUpdate = $state(false);
+  let downloadProgress = $state(0);
+  let downloadedBytes = $state(0);
+  let totalBytes = $state(0);
+  let updateStatusText = $state("");
+  let showUpdateModal = $state(false);
+
+  function formatBytes(bytes: number): string {
+    if (!bytes || bytes <= 0) return "0 MB";
+    const mb = bytes / (1024 * 1024);
+    return `${mb.toFixed(1)} MB`;
+  }
+
+  async function checkForUpdates(silent: boolean = false) {
+    if (isCheckingUpdate || isDownloadingUpdate) return;
+    isCheckingUpdate = true;
+    updateStatusText = "Checking for updates...";
+
+    try {
+      const update = await check();
+      if (update) {
+        availableUpdate = update;
+        showUpdateModal = true;
+        updateStatusText = `Update available: v${update.version}`;
+      } else {
+        availableUpdate = null;
+        updateStatusText = "OpenRemote is up to date (v1.0.0)";
+      }
+    } catch (err: any) {
+      console.warn("Auto-updater check notice:", err);
+      updateStatusText = "OpenRemote is up to date (v1.0.0)";
+    } finally {
+      isCheckingUpdate = false;
+    }
+  }
+
+  async function startUpdateAndRestart() {
+    if (!availableUpdate || isDownloadingUpdate) return;
+    isDownloadingUpdate = true;
+    downloadProgress = 0;
+    downloadedBytes = 0;
+    totalBytes = 0;
+
+    try {
+      await availableUpdate.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          totalBytes = event.data.contentLength ?? 0;
+        } else if (event.event === "Progress") {
+          downloadedBytes += event.data.chunkLength;
+          if (totalBytes > 0) {
+            downloadProgress = Math.min(100, Math.round((downloadedBytes / totalBytes) * 100));
+          }
+        } else if (event.event === "Finished") {
+          downloadProgress = 100;
+        }
+      });
+
+      // Restart application with newly installed binary
+      await invoke("app_relaunch");
+    } catch (err: any) {
+      console.error("Failed to download or install update:", err);
+      alert(`Update installation error: ${err?.message || err}`);
+      isDownloadingUpdate = false;
+    }
+  }
+
+  function dismissUpdateModal() {
+    if (isDownloadingUpdate) return;
+    showUpdateModal = false;
+  }
 
   async function loadHostSessionState() {
     try {
@@ -871,6 +946,7 @@
     loadMonitors();
     loadRecentSessions();
     loadHostSessionState();
+    checkForUpdates(true);
 
     animFrameId = requestAnimationFrame(renderLoop);
 
@@ -933,6 +1009,18 @@
           <span class="pill-dot"></span>
           <span>{systemInfo.lan_ip}</span>
         </div>
+      {/if}
+
+      {#if availableUpdate}
+        <button
+          class="update-pill"
+          data-tauri-drag-region="false"
+          onclick={() => (showUpdateModal = true)}
+          title="Software update is available"
+        >
+          <span class="update-dot"></span>
+          <span>v{availableUpdate.version} Available</span>
+        </button>
       {/if}
     </div>
 
@@ -1436,6 +1524,40 @@
                 {/if}
               </div>
             </div>
+            <!-- Software Update Card -->
+            <div class="engine-section-card">
+              <div class="card-caption">
+                <span class="section-label">SOFTWARE UPDATE</span>
+                <h2 class="card-heading">Version & Updates</h2>
+              </div>
+              <div class="update-card-content">
+                <div class="update-info-group">
+                  <div class="update-version-row">
+                    <span class="version-label">Current Version:</span>
+                    <span class="version-badge">v1.0.0</span>
+                    {#if availableUpdate}
+                      <span class="update-ready-pill">v{availableUpdate.version} Ready</span>
+                    {/if}
+                  </div>
+                  <p class="update-status-msg">{updateStatusText || "OpenRemote is up to date"}</p>
+                </div>
+                <button
+                  class="btn-check-updates"
+                  disabled={isCheckingUpdate || isDownloadingUpdate}
+                  onclick={() => checkForUpdates(false)}
+                >
+                  {#if isCheckingUpdate}
+                    <span class="btn-spinner"></span>
+                    <span>Checking...</span>
+                  {:else}
+                    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                    </svg>
+                    <span>Check for Updates</span>
+                  {/if}
+                </button>
+              </div>
+            </div>
           </div>
         {/if}
 
@@ -1466,6 +1588,90 @@
             <span class="engine-bullet">●</span>
             <span class="engine-name">Channels:</span>
             <span class="engine-tech">UDP (Control) + TCP (Frames)</span>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Auto-Updater Modal Dialog -->
+    {#if showUpdateModal && availableUpdate}
+      <div class="modal-backdrop">
+        <div class="modal-card update-modal-card">
+          <div class="modal-header">
+            <div class="modal-badge-icon update-badge-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+            </div>
+            <div>
+              <h3 class="modal-title">New Version Available!</h3>
+              <p class="modal-subtitle">OpenRemote v{availableUpdate.version} is ready to download and install.</p>
+            </div>
+          </div>
+
+          <div class="update-details-box">
+            <div class="detail-row">
+              <span class="detail-key">Current Version:</span>
+              <span class="detail-val">{availableUpdate.currentVersion || "1.0.0"}</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-key">Latest Version:</span>
+              <span class="detail-val update-val-highlight">v{availableUpdate.version}</span>
+            </div>
+            {#if availableUpdate.date}
+              <div class="detail-row">
+                <span class="detail-key">Release Date:</span>
+                <span class="detail-val">{availableUpdate.date.split("T")[0]}</span>
+              </div>
+            {/if}
+          </div>
+
+          {#if availableUpdate.body}
+            <div class="update-notes-box">
+              <span class="notes-heading">RELEASE NOTES</span>
+              <div class="notes-content">{availableUpdate.body}</div>
+            </div>
+          {/if}
+
+          {#if isDownloadingUpdate}
+            <div class="update-progress-section">
+              <div class="progress-bar-track">
+                <div class="progress-bar-fill" style="width: {downloadProgress}%;"></div>
+              </div>
+              <div class="progress-meta">
+                <span>Downloading update... {downloadProgress}%</span>
+                <span>{formatBytes(downloadedBytes)} / {formatBytes(totalBytes)}</span>
+              </div>
+            </div>
+          {/if}
+
+          <div class="modal-actions">
+            <button
+              class="btn-decline"
+              disabled={isDownloadingUpdate}
+              onclick={dismissUpdateModal}
+            >
+              Remind Later
+            </button>
+            <button
+              class="btn-accept"
+              disabled={isDownloadingUpdate}
+              onclick={startUpdateAndRestart}
+            >
+              {#if isDownloadingUpdate}
+                <span class="btn-spinner"></span>
+                <span>Installing Update...</span>
+              {:else}
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="7 10 12 15 17 10"></polyline>
+                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                <span>Update & Restart</span>
+              {/if}
+            </button>
           </div>
         </div>
       </div>
@@ -2752,5 +2958,171 @@
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.4; }
+  }
+
+  /* Titlebar Update Pill */
+  .update-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(34, 197, 94, 0.15);
+    border: 1px solid rgba(34, 197, 94, 0.35);
+    color: #4ade80;
+    padding: 3px 9px;
+    border-radius: 9999px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .update-pill:hover {
+    background: rgba(34, 197, 94, 0.25);
+    box-shadow: 0 0 10px rgba(34, 197, 94, 0.3);
+  }
+  .update-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #22c55e;
+    animation: pulse 1.2s infinite;
+  }
+
+  /* Software Update Card in Engine Tab */
+  .update-card-content {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 10px;
+    flex-wrap: wrap;
+  }
+  .update-info-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .update-version-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .version-label {
+    font-size: 0.82rem;
+    color: #94a3b8;
+  }
+  .version-badge {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: #f1f5f9;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-family: monospace;
+    font-weight: 700;
+  }
+  .update-ready-pill {
+    background: rgba(34, 197, 94, 0.2);
+    border: 1px solid rgba(34, 197, 94, 0.4);
+    color: #4ade80;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 0.72rem;
+    font-weight: 700;
+  }
+  .update-status-msg {
+    margin: 0;
+    font-size: 0.78rem;
+    color: #64748b;
+  }
+  .btn-check-updates {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.3);
+    color: #38bdf8;
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .btn-check-updates:hover:not(:disabled) {
+    background: rgba(56, 189, 248, 0.22);
+    border-color: #38bdf8;
+  }
+  .btn-check-updates:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  /* Auto-Updater Modal */
+  .update-modal-card {
+    max-width: 480px;
+  }
+  .update-badge-icon {
+    background: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+  }
+  .update-details-box {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .update-val-highlight {
+    color: #4ade80;
+    font-weight: 700;
+  }
+  .update-notes-box {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 160px;
+    overflow-y: auto;
+  }
+  .notes-heading {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #64748b;
+    letter-spacing: 0.5px;
+  }
+  .notes-content {
+    font-size: 0.8rem;
+    color: #cbd5e1;
+    line-height: 1.4;
+    white-space: pre-line;
+  }
+  .update-progress-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .progress-bar-track {
+    width: 100%;
+    height: 8px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #0284c7, #38bdf8);
+    border-radius: 4px;
+    transition: width 0.15s ease-out;
+  }
+  .progress-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.75rem;
+    color: #94a3b8;
   }
 </style>

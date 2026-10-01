@@ -1,0 +1,119 @@
+name: Build Windows Installers & Updater
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Stable & Target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Install Frontend Dependencies
+        working-directory: app-ui
+        run: pnpm install
+
+      - name: Build SvelteKit Frontend
+        working-directory: app-ui
+        run: pnpm build
+
+      - name: Build Tauri Windows Installer & Updater Bundle
+        working-directory: app-ui
+        env:
+          RUST_BACKTRACE: 1
+          # Tauri Auto-Updater Signing Keys
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD || '' }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD || '' }}
+        run: |
+          pnpm tauri build --target x86_64-pc-windows-msvc --verbose
+
+      - name: Locate and Collect Release Artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+          # 1. Collect NSIS Installer (.exe)
+          $setupExe = Get-ChildItem -Path target -Recurse -Filter "*setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($setupExe) {
+            Copy-Item $setupExe.FullName "artifacts/OpenRemote-Windows-x64-Setup.exe"
+            Write-Host "Collected Setup: artifacts/OpenRemote-Windows-x64-Setup.exe"
+          }
+
+          # 2. Collect MSI Installer (.msi)
+          $msi = Get-ChildItem -Path target -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($msi) {
+            Copy-Item $msi.FullName "artifacts/OpenRemote-Windows-x64.msi"
+            Write-Host "Collected MSI: artifacts/OpenRemote-Windows-x64.msi"
+          }
+
+          # 3. Collect Updater Bundle (.nsis.zip or .zip) and signature (.sig)
+          $zip = Get-ChildItem -Path target -Recurse -Filter "*.nsis.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $zip) {
+            $zip = Get-ChildItem -Path target -Recurse -Filter "*.zip" -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*updater*" -or $_.Name -like "*setup*" } | Select-Object -First 1
+          }
+
+          $sig = Get-ChildItem -Path target -Recurse -Filter "*.nsis.zip.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sig) {
+            $sig = Get-ChildItem -Path target -Recurse -Filter "*.zip.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+
+          if ($zip -and $sig) {
+            Copy-Item $zip.FullName "artifacts/OpenRemote-Windows-x64.nsis.zip"
+            Copy-Item $sig.FullName "artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
+            Write-Host "Collected Update Archive: artifacts/OpenRemote-Windows-x64.nsis.zip"
+            Write-Host "Collected Signature: artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
+
+            # 4. Generate / Update latest.json
+            node scripts/update-latest-json.js `
+              windows-x86_64 `
+              "artifacts/OpenRemote-Windows-x64.nsis.zip.sig" `
+              "OpenRemote-Windows-x64.nsis.zip"
+          } else {
+            Write-Host "Notice: Updater bundle not generated (check if TAURI_PRIVATE_KEY secret is configured)."
+          }
+
+          Write-Host "=== Artifacts Directory Contents ==="
+          Get-ChildItem -Path artifacts
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenRemote-Windows-x64
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
