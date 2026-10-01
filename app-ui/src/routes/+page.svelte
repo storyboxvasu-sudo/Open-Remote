@@ -1350,7 +1350,9 @@
           </button>
         </div>
 
-        {#if activeDashboardTab === "connect"}
+        <!-- Scrollable Dashboard Content Area -->
+        <div class="dashboard-scroll-body">
+          {#if activeDashboardTab === "connect"}
           <!-- Dual Column Unified Desk Cards -->
           <div class="desks-row">
             <!-- Left Column: This Desk (Host / Share) -->
@@ -1823,7 +1825,8 @@
           </div>
         </div>
       </div>
-    {/if}
+    </div>
+  {/if}
 
     <!-- Auto-Updater Modal Dialog -->
     {#if showUpdateModal && availableUpdate}
@@ -2384,11 +2387,13 @@
     flex: 1;
     display: flex;
     flex-direction: column;
-    justify-content: center;
     max-width: 1040px;
+    width: 100%;
     margin: 0 auto;
-    padding: 24px 32px;
-    gap: 24px;
+    padding: 0 32px;
+    height: 100%;
+    box-sizing: border-box;
+    overflow: hidden;
   }
 
   .desks-row {
@@ -2659,6 +2664,8 @@
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 10px;
     padding: 12px 18px;
+    flex-shrink: 0;
+    margin-top: auto;
   }
 
   .engine-item {
@@ -3020,14 +3027,50 @@
     border: 1px solid rgba(74, 222, 128, 0.4);
   }
 
-  /* Dashboard Tabs */
+  /* Dashboard Tabs (Fixed at Top of Dashboard) */
   .dashboard-tabs {
+    flex-shrink: 0;
     display: flex;
     gap: 8px;
-    margin-bottom: 20px;
+    padding: 16px 0 12px 0;
+    margin-bottom: 0;
     border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    padding-bottom: 10px;
+    position: relative;
+    z-index: 20;
+    background: transparent;
   }
+
+  /* Scrollable Container for Dashboard Views */
+  .dashboard-scroll-body {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-top: 1.5rem; /* pt-6 / mt-4 spacing so top card does not stick to tab bar */
+    padding-bottom: 3rem; /* pb-12 so bottom cards/status bar don't get cut off */
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+  }
+
+  .dashboard-scroll-body::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .dashboard-scroll-body::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .dashboard-scroll-body::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.16);
+    border-radius: 4px;
+  }
+
+  .dashboard-scroll-body::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.28);
+  }
+
   .tab-btn {
     display: flex;
     align-items: center;
@@ -3063,7 +3106,8 @@
   .engine-tab-container {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: 20px;
+    padding-top: 0.25rem;
   }
   .perm-section-card,
   .engine-section-card {
