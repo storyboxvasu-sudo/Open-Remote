@@ -168,7 +168,10 @@ async fn internal_start_hosting(
                 // Restore & focus host window so user notices the connection request dialog
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
-                    let _ = window.unminimize();
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        let _ = window.unminimize();
+                    }
                     let _ = window.set_focus();
                 }
                 let _ = app.emit("incoming-connection-request", &info);
