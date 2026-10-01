@@ -147,6 +147,7 @@
   let showPasswordText = $state(false);
   let showConfirmPasswordText = $state(false);
   let selectedProfileModal = $state<AccessLevel>("Standard");
+  let isProfileDropdownOpen = $state(false);
   let setPasswordError = $state("");
   let isSavingPassword = $state(false);
 
@@ -335,14 +336,21 @@
     showPasswordText = false;
     showConfirmPasswordText = false;
     selectedProfileModal = unattendedConfig.profile || "Standard";
+    isProfileDropdownOpen = false;
     showSetPasswordModal = true;
   }
 
   function closeSetPasswordModal() {
     showSetPasswordModal = false;
+    isProfileDropdownOpen = false;
     passwordInput = "";
     confirmPasswordInput = "";
     setPasswordError = "";
+  }
+
+  function selectModalProfile(profile: AccessLevel) {
+    selectedProfileModal = profile;
+    isProfileDropdownOpen = false;
   }
 
   async function saveUnattendedPassword() {
@@ -2080,14 +2088,112 @@
               </div>
             </div>
 
-            <!-- Permission Profile -->
-            <div class="input-field-group">
-              <label for="modal-profile-select">Default Permission Profile</label>
-              <select id="modal-profile-select" class="modal-select" bind:value={selectedProfileModal}>
-                <option value="ViewOnly">Screen Sharing (View Only)</option>
-                <option value="Standard">Default (Standard Access)</option>
-                <option value="FullAccess">Full Access</option>
-              </select>
+            <!-- Permission Profile (Custom Dropdown) -->
+            <div class="input-field-group profile-dropdown-group">
+              <label for="modal-profile-trigger">Default Permission Profile</label>
+
+              {#if isProfileDropdownOpen}
+                <div
+                  class="dropdown-overlay"
+                  onclick={() => (isProfileDropdownOpen = false)}
+                  role="presentation"
+                ></div>
+              {/if}
+
+              <div class="custom-dropdown-container">
+                <button
+                  type="button"
+                  id="modal-profile-trigger"
+                  class="custom-dropdown-trigger"
+                  class:active={isProfileDropdownOpen}
+                  onclick={() => (isProfileDropdownOpen = !isProfileDropdownOpen)}
+                  aria-haspopup="listbox"
+                  aria-expanded={isProfileDropdownOpen}
+                >
+                  <div class="dropdown-trigger-left">
+                    {#if selectedProfileModal === "ViewOnly"}
+                      <span class="profile-icon">🔒</span>
+                      <span class="profile-title">Screen Sharing (View Only)</span>
+                    {:else if selectedProfileModal === "Standard"}
+                      <span class="profile-icon">⚡</span>
+                      <span class="profile-title">Default (Standard Access)</span>
+                    {:else}
+                      <span class="profile-icon">🛡</span>
+                      <span class="profile-title">Full Access</span>
+                    {/if}
+                  </div>
+                  <svg
+                    class="chevron-icon"
+                    class:rotated={isProfileDropdownOpen}
+                    viewBox="0 0 24 24"
+                    width="16"
+                    height="16"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <polyline points="6 9 12 15 18 9"></polyline>
+                  </svg>
+                </button>
+
+                {#if isProfileDropdownOpen}
+                  <div class="custom-dropdown-menu" role="listbox">
+                    <button
+                      type="button"
+                      class="dropdown-option-item"
+                      class:selected={selectedProfileModal === "ViewOnly"}
+                      onclick={() => selectModalProfile("ViewOnly")}
+                      role="option"
+                      aria-selected={selectedProfileModal === "ViewOnly"}
+                    >
+                      <span class="option-icon">🔒</span>
+                      <div class="option-info">
+                        <span class="option-name">Screen Sharing (View Only)</span>
+                        <span class="option-desc">Remote partner can only view screen; mouse & typing blocked</span>
+                      </div>
+                      {#if selectedProfileModal === "ViewOnly"}
+                        <span class="option-check">✓</span>
+                      {/if}
+                    </button>
+
+                    <button
+                      type="button"
+                      class="dropdown-option-item"
+                      class:selected={selectedProfileModal === "Standard"}
+                      onclick={() => selectModalProfile("Standard")}
+                      role="option"
+                      aria-selected={selectedProfileModal === "Standard"}
+                    >
+                      <span class="option-icon">⚡</span>
+                      <div class="option-info">
+                        <span class="option-name">Default (Standard Access)</span>
+                        <span class="option-desc">Allows remote mouse clicks and keyboard typing</span>
+                      </div>
+                      {#if selectedProfileModal === "Standard"}
+                        <span class="option-check">✓</span>
+                      {/if}
+                    </button>
+
+                    <button
+                      type="button"
+                      class="dropdown-option-item"
+                      class:selected={selectedProfileModal === "FullAccess"}
+                      onclick={() => selectModalProfile("FullAccess")}
+                      role="option"
+                      aria-selected={selectedProfileModal === "FullAccess"}
+                    >
+                      <span class="option-icon">🛡</span>
+                      <div class="option-info">
+                        <span class="option-name">Full Access</span>
+                        <span class="option-desc">Unrestricted mouse, keyboard, and display switching</span>
+                      </div>
+                      {#if selectedProfileModal === "FullAccess"}
+                        <span class="option-check">✓</span>
+                      {/if}
+                    </button>
+                  </div>
+                {/if}
+              </div>
             </div>
 
             {#if setPasswordError}
@@ -3299,6 +3405,8 @@
     display: flex;
     flex-direction: column;
     gap: 18px;
+    position: relative;
+    overflow: visible;
   }
   .modal-header {
     display: flex;
@@ -3834,7 +3942,9 @@
 
   /* Password Modals */
   .password-modal-card {
-    max-width: 440px;
+    max-width: 460px;
+    position: relative;
+    overflow: visible;
   }
 
   .auth-badge-icon {
@@ -3847,12 +3957,16 @@
     flex-direction: column;
     gap: 14px;
     margin: 16px 0;
+    position: relative;
+    overflow: visible;
   }
 
   .input-field-group {
     display: flex;
     flex-direction: column;
     gap: 6px;
+    position: relative;
+    overflow: visible;
   }
 
   .input-field-group label {
@@ -3884,17 +3998,160 @@
     border-color: #38bdf8;
   }
 
-  .modal-select {
+  .profile-select-control option {
+    background-color: #0f172a;
+    color: #f1f5f9;
+    padding: 8px 12px;
+  }
+
+  /* Custom Profile Dropdown in Set Password Modal */
+  .profile-dropdown-group {
+    position: relative;
+    z-index: 50;
+  }
+
+  .dropdown-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 40;
+    background: transparent;
+    cursor: default;
+  }
+
+  .custom-dropdown-container {
+    position: relative;
     width: 100%;
-    background: rgba(15, 23, 42, 0.8);
-    border: 1px solid rgba(255, 255, 255, 0.15);
+    z-index: 45;
+  }
+
+  .custom-dropdown-trigger {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(15, 23, 42, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.18);
     border-radius: 8px;
+    padding: 10px 14px;
     color: #ffffff;
-    font-size: 0.85rem;
-    padding: 9px 12px;
-    outline: none;
-    box-sizing: border-box;
     cursor: pointer;
+    transition: all 0.15s ease;
+    box-sizing: border-box;
+    font-size: 0.86rem;
+  }
+
+  .custom-dropdown-trigger:hover,
+  .custom-dropdown-trigger.active {
+    border-color: #38bdf8;
+    background: rgba(15, 23, 42, 1);
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.25);
+  }
+
+  .dropdown-trigger-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .profile-icon {
+    font-size: 1.05rem;
+    line-height: 1;
+  }
+
+  .profile-title {
+    font-weight: 600;
+    color: #f1f5f9;
+    font-size: 0.86rem;
+  }
+
+  .chevron-icon {
+    color: #94a3b8;
+    transition: transform 0.2s ease;
+    flex-shrink: 0;
+  }
+
+  .chevron-icon.rotated {
+    transform: rotate(180deg);
+    color: #38bdf8;
+  }
+
+  .custom-dropdown-menu {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: calc(100% + 6px);
+    background: #1e293b;
+    border: 1px solid rgba(56, 189, 248, 0.45);
+    border-radius: 10px;
+    padding: 6px;
+    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.75), 0 0 15px rgba(56, 189, 248, 0.15);
+    z-index: 55;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    animation: fadeIn 0.12s ease-out;
+  }
+
+  .dropdown-option-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 12px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: #f1f5f9;
+    text-align: left;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    box-sizing: border-box;
+  }
+
+  .dropdown-option-item:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .dropdown-option-item.selected {
+    background: rgba(56, 189, 248, 0.16);
+    border-color: rgba(56, 189, 248, 0.45);
+  }
+
+  .option-icon {
+    font-size: 1.15rem;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+
+  .option-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+  }
+
+  .option-name {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: #f8fafc;
+  }
+
+  .option-desc {
+    font-size: 0.74rem;
+    color: #94a3b8;
+    line-height: 1.3;
+  }
+
+  .option-check {
+    font-size: 0.88rem;
+    font-weight: 700;
+    color: #38bdf8;
+    margin-left: 6px;
+    flex-shrink: 0;
   }
 
   .btn-eye {
