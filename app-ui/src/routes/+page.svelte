@@ -1,6 +1,23 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+  type AccessLevel = "ViewOnly" | "Standard" | "FullAccess";
+
+  interface IncomingRequestInfo {
+    request_id: string;
+    client_peer_id: string;
+    client_ip: string;
+  }
+
+  interface HostSessionInfo {
+    is_active: boolean;
+    client_peer_id: string | null;
+    client_ip: string | null;
+    access_level: AccessLevel;
+    default_access_level: AccessLevel;
+  }
 
   interface SystemInfo {
     peer_id: string;
@@ -24,6 +41,7 @@
     local_ws_port: number;
     target_ip: string;
     message: string;
+    initial_access_level?: AccessLevel;
   }
 
   interface MonitorDescriptor {
@@ -97,6 +115,82 @@
   let isHoldTriggered = false;
   let isPinchingOrPanning = false;
   let virtualKeyboardInputRef = $state<HTMLInputElement | null>(null);
+
+  // Permissions & Incoming Requests State
+  let incomingRequest = $state<IncomingRequestInfo | null>(null);
+  let showIncomingModal = $state(false);
+  let selectedIncomingPermission = $state<AccessLevel>("Standard");
+  let hostSession = $state<HostSessionInfo | null>(null);
+  let activeDashboardTab = $state<"connect" | "permissions" | "engine">("connect");
+  let clientAccessLevel = $state<AccessLevel>("Standard");
+  let unlistenIncoming: UnlistenFn | null = null;
+  let unlistenSession: UnlistenFn | null = null;
+
+  async function loadHostSessionState() {
+    try {
+      const session: HostSessionInfo = await invoke("get_host_session_state");
+      hostSession = session;
+      if (!incomingRequest) {
+        selectedIncomingPermission = session.default_access_level || "Standard";
+      }
+    } catch (err) {
+      console.error("Failed to load host session state:", err);
+    }
+  }
+
+  async function acceptIncomingConnection() {
+    if (!incomingRequest) return;
+    try {
+      await invoke("respond_connection_request", {
+        requestId: incomingRequest.request_id,
+        accept: true,
+        accessLevel: selectedIncomingPermission,
+      });
+      showIncomingModal = false;
+      incomingRequest = null;
+      await loadHostSessionState();
+    } catch (err) {
+      console.error("Failed to accept connection:", err);
+    }
+  }
+
+  async function declineIncomingConnection() {
+    if (!incomingRequest) return;
+    try {
+      await invoke("respond_connection_request", {
+        requestId: incomingRequest.request_id,
+        accept: false,
+        accessLevel: "ViewOnly",
+      });
+      showIncomingModal = false;
+      incomingRequest = null;
+      await loadHostSessionState();
+    } catch (err) {
+      console.error("Failed to decline connection:", err);
+    }
+  }
+
+  async function updateHostAccessLevel(level: AccessLevel) {
+    try {
+      await invoke("set_session_access_level", { accessLevel: level });
+      if (hostSession) {
+        hostSession.access_level = level;
+      }
+    } catch (err) {
+      console.error("Failed to update session access level:", err);
+    }
+  }
+
+  async function updateDefaultAccessLevel(level: AccessLevel) {
+    try {
+      await invoke("set_default_access_level", { accessLevel: level });
+      if (hostSession) {
+        hostSession.default_access_level = level;
+      }
+    } catch (err) {
+      console.error("Failed to update default access level:", err);
+    }
+  }
 
   async function loadSystemInfo() {
     try {
@@ -218,6 +312,9 @@
       if (res.success) {
         isConnected = true;
         isConnecting = false;
+        if (res.initial_access_level) {
+          clientAccessLevel = res.initial_access_level;
+        }
         loadRecentSessions();
         initStreamWebSocket(res.local_ws_port);
       }
@@ -244,6 +341,7 @@
     remoteDisplays = [];
     activeRemoteDisplayId = 1;
     dirtyFramePending = false;
+    clientAccessLevel = "Standard";
     if (canvasRef) {
       const ctx = canvasRef.getContext("2d");
       if (ctx) ctx.clearRect(0, 0, canvasRef.width, canvasRef.height);
@@ -264,16 +362,19 @@
     };
 
     socket.onmessage = (event: MessageEvent) => {
-      // 1. Dynamic Display Manifest from Remote Host
+      // 1. Dynamic Display Manifest & Permission updates from Remote Host
       if (typeof event.data === "string") {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === "display_manifest" && Array.isArray(msg.displays)) {
             remoteDisplays = msg.displays;
             activeRemoteDisplayId = msg.active_display_id || 1;
+          } else if (msg.type === "permission_update" && msg.access_level) {
+            clientAccessLevel = msg.access_level;
+            console.log("Remote permission level updated to:", clientAccessLevel);
           }
         } catch (e) {
-          console.error("Display manifest parse error:", e);
+          console.error("Stream json parse error:", e);
         }
         return;
       }
@@ -364,6 +465,7 @@
 
   function handleTouchStart(e: TouchEvent) {
     if (!isConnected) return;
+    if (clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
 
     if (e.touches.length === 1) {
@@ -414,6 +516,7 @@
 
   async function handleTouchMove(e: TouchEvent) {
     if (!isConnected) return;
+    if (clientAccessLevel === "ViewOnly" && zoomScale <= 1.05) return;
     e.preventDefault();
 
     if (e.touches.length === 1) {
@@ -465,6 +568,7 @@
 
   async function handleTouchEnd(e: TouchEvent) {
     if (!isConnected) return;
+    if (clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
     if (holdTimer) clearTimeout(holdTimer);
 
@@ -558,7 +662,7 @@
   }
 
   async function handleVirtualKeyDown(e: KeyboardEvent) {
-    if (!isConnected) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     if (e.key === "Backspace") {
       await invoke("send_input", {
         event: { type: "KeyDown", data: { scancode: 8, key: "Backspace" } }
@@ -577,7 +681,7 @@
   }
 
   async function handleVirtualInput(e: Event) {
-    if (!isConnected) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     const input = e.target as HTMLInputElement;
     const val = input.value;
     if (!val) return;
@@ -593,7 +697,7 @@
   }
 
   async function handleMouseMove(e: MouseEvent) {
-    if (!isConnected) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     const now = performance.now();
     if (now - lastMoveTime < 8) return;
     lastMoveTime = now;
@@ -608,7 +712,7 @@
   }
 
   async function handleMouseDown(e: MouseEvent) {
-    if (!isConnected) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
     const { x, y } = getNormalizedCoordinates(e);
     const button = e.button === 0 ? "Left" : e.button === 1 ? "Middle" : "Right";
@@ -622,7 +726,7 @@
   }
 
   async function handleMouseUp(e: MouseEvent) {
-    if (!isConnected) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
     const { x, y } = getNormalizedCoordinates(e);
     const button = e.button === 0 ? "Left" : e.button === 1 ? "Middle" : "Right";
@@ -636,7 +740,7 @@
   }
 
   async function handleWheel(e: WheelEvent) {
-    if (!isConnected) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
     await invoke("send_input", {
       event: {
@@ -650,7 +754,7 @@
   }
 
   async function handleKeyDown(e: KeyboardEvent) {
-    if (!isConnected) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
     if (tag === "input" || tag === "textarea") return;
 
@@ -667,7 +771,7 @@
   }
 
   async function handleKeyUp(e: KeyboardEvent) {
-    if (!isConnected) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
     if (tag === "input" || tag === "textarea") return;
 
@@ -760,10 +864,13 @@
     animFrameId = requestAnimationFrame(renderLoop);
   }
 
-  onMount(() => {
+  let fpsInterval: number | null = null;
+
+  onMount(async () => {
     loadSystemInfo();
     loadMonitors();
     loadRecentSessions();
+    loadHostSessionState();
 
     animFrameId = requestAnimationFrame(renderLoop);
 
@@ -771,12 +878,30 @@
       fps = frameCount;
       frameCount = 0;
     }, 1000);
+
+    try {
+      unlistenIncoming = await listen<IncomingRequestInfo>("incoming-connection-request", (event) => {
+        incomingRequest = event.payload;
+        showIncomingModal = true;
+        if (hostSession) {
+          selectedIncomingPermission = hostSession.default_access_level || "Standard";
+        }
+      });
+
+      unlistenSession = await listen<HostSessionInfo>("session-status-changed", (event) => {
+        hostSession = event.payload;
+      });
+    } catch (err) {
+      console.error("Failed to attach event listeners:", err);
+    }
   });
 
   onDestroy(() => {
     if (animFrameId) cancelAnimationFrame(animFrameId);
     if (fpsInterval) clearInterval(fpsInterval);
     if (ws) ws.close();
+    if (unlistenIncoming) unlistenIncoming();
+    if (unlistenSession) unlistenSession();
   });
 </script>
 
@@ -920,6 +1045,23 @@
             ⌨
           </button>
 
+          <!-- Session Permission Badge -->
+          <div
+            class="hud-tag permission-badge"
+            class:badge-viewonly={clientAccessLevel === "ViewOnly"}
+            class:badge-standard={clientAccessLevel === "Standard"}
+            class:badge-full={clientAccessLevel === "FullAccess"}
+            title="Current Session Permission Level"
+          >
+            {#if clientAccessLevel === "ViewOnly"}
+              🔒 View Only
+            {:else if clientAccessLevel === "Standard"}
+              ⚡ Standard
+            {:else}
+              🛡 Full Access
+            {/if}
+          </div>
+
           <div class="hud-tag res">{remoteResolution.width}x{remoteResolution.height}</div>
           <div class="hud-tag">{fps} FPS</div>
           <div class="hud-tag">{rttMs} ms</div>
@@ -936,165 +1078,363 @@
     {:else}
       <!-- Unified AnyDesk-Style Dashboard -->
       <div class="dashboard-container">
-        <!-- Dual Column Unified Desk Cards -->
-        <div class="desks-row">
-          <!-- Left Column: This Desk (Host / Share) -->
-          <div class="desk-card this-desk">
-            <div class="card-caption">
-              <span class="section-label">THIS DESK</span>
-              <h2 class="card-heading">Your Address</h2>
-            </div>
+        <!-- Top Navigation Tabs -->
+        <div class="dashboard-tabs">
+          <button
+            class="tab-btn"
+            class:active={activeDashboardTab === "connect"}
+            onclick={() => (activeDashboardTab = "connect")}
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+              <line x1="8" y1="21" x2="16" y2="21"></line>
+              <line x1="12" y1="17" x2="12" y2="21"></line>
+            </svg>
+            <span>Connect & Share</span>
+          </button>
+          <button
+            class="tab-btn"
+            class:active={activeDashboardTab === "permissions"}
+            onclick={() => (activeDashboardTab = "permissions")}
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            </svg>
+            <span>Permissions</span>
+            {#if hostSession?.is_active}
+              <span class="active-session-indicator" title="Active Client Connected">●</span>
+            {/if}
+          </button>
+          <button
+            class="tab-btn"
+            class:active={activeDashboardTab === "engine"}
+            onclick={() => (activeDashboardTab = "engine")}
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+            <span>Engine & Displays</span>
+          </button>
+        </div>
 
-            <div class="address-display">
-              <div class="address-digits">
-                {#if systemInfo}
-                  <span class="digits-text">{systemInfo.peer_id}</span>
-                {:else}
-                  <span class="digits-placeholder">Connecting...</span>
-                {/if}
+        {#if activeDashboardTab === "connect"}
+          <!-- Dual Column Unified Desk Cards -->
+          <div class="desks-row">
+            <!-- Left Column: This Desk (Host / Share) -->
+            <div class="desk-card this-desk">
+              <div class="card-caption">
+                <span class="section-label">THIS DESK</span>
+                <h2 class="card-heading">Your Address</h2>
               </div>
-              <button
-                class="btn-copy-address"
-                onclick={copyAddress}
-                title="Copy Address to Clipboard"
-              >
-                {#if copied}
-                  <span class="copy-success">✓ Copied!</span>
-                {:else}
-                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                  </svg>
-                  <span>Copy ID</span>
-                {/if}
-              </button>
-            </div>
 
-            <!-- Listening Status Dot -->
-            <div class="status-indicator-row">
-              <span class="status-dot" class:active={isHosting}></span>
-              <span class="status-text">{hostStatusMessage}</span>
-            </div>
-
-            <div class="desk-footer">
-              <div class="meta-item">
-                <span class="meta-title">Direct LAN Address:</span>
-                <span class="meta-val">{systemInfo?.lan_ip || "127.0.0.1"}:44321</span>
-              </div>
-              <button
-                class="btn-toggle-service"
-                class:active={isHosting}
-                onclick={toggleHosting}
-              >
-                {isHosting ? "Sharing Active" : "Start Sharing"}
-              </button>
-            </div>
-          </div>
-
-          <!-- Right Column: Remote Desk (Connect) -->
-          <div class="desk-card remote-desk">
-            <div class="card-caption">
-              <span class="section-label">REMOTE DESK</span>
-              <h2 class="card-heading">Connect to Partner</h2>
-            </div>
-
-            <div class="connect-form">
-              <div class="input-and-button">
-                <input
-                  type="text"
-                  class="remote-input"
-                  placeholder="Enter 9-Digit Peer ID or IP (e.g. 901-435-944 or 192.168.1.50)"
-                  bind:value={targetAddress}
-                  onkeypress={handleKeypressConnect}
-                />
-                <button
-                  class="btn-connect-primary"
-                  disabled={isConnecting || !targetAddress.trim()}
-                  onclick={connectToRemote}
-                >
-                  {#if isConnecting}
-                    <span class="btn-spinner"></span>
-                    <span>Connecting...</span>
+              <div class="address-display">
+                <div class="address-digits">
+                  {#if systemInfo}
+                    <span class="digits-text">{systemInfo.peer_id}</span>
                   {:else}
-                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5">
-                      <line x1="5" y1="12" x2="19" y2="12"></line>
-                      <polyline points="12 5 19 12 12 19"></polyline>
+                    <span class="digits-placeholder">Connecting...</span>
+                  {/if}
+                </div>
+                <button
+                  class="btn-copy-address"
+                  onclick={copyAddress}
+                  title="Copy Address to Clipboard"
+                >
+                  {#if copied}
+                    <span class="copy-success">✓ Copied!</span>
+                  {:else}
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                     </svg>
-                    <span>Connect</span>
+                    <span>Copy ID</span>
                   {/if}
                 </button>
               </div>
 
-              {#if connectionError}
-                <div class="inline-error">
-                  <span>⚠</span> {connectionError}
-                </div>
-              {/if}
+              <!-- Listening Status Dot -->
+              <div class="status-indicator-row">
+                <span class="status-dot" class:active={isHosting}></span>
+                <span class="status-text">{hostStatusMessage}</span>
+              </div>
 
-              <!-- Quick Localhost Loopback Shortcut -->
-              <div class="quick-targets">
-                <span class="quick-label">Quick Loopback:</span>
+              <div class="desk-footer">
+                <div class="meta-item">
+                  <span class="meta-title">Direct LAN Address:</span>
+                  <span class="meta-val">{systemInfo?.lan_ip || "127.0.0.1"}:44321</span>
+                </div>
                 <button
-                  class="quick-pill"
-                  onclick={() => { targetAddress = "127.0.0.1:44321"; connectToRemote(); }}
+                  class="btn-toggle-service"
+                  class:active={isHosting}
+                  onclick={toggleHosting}
                 >
-                  127.0.0.1:44321
+                  {isHosting ? "Sharing Active" : "Start Sharing"}
                 </button>
               </div>
             </div>
 
-            <div class="desk-footer security-note">
-              <div class="feature-tag">
-                <span class="feature-icon">⚡</span> Sub-10ms Input Response
+            <!-- Right Column: Remote Desk (Connect) -->
+            <div class="desk-card remote-desk">
+              <div class="card-caption">
+                <span class="section-label">REMOTE DESK</span>
+                <h2 class="card-heading">Connect to Partner</h2>
               </div>
-              <div class="feature-tag">
-                <span class="feature-icon">🛡</span> Direct P2P Encryption
+
+              <div class="connect-form">
+                <div class="input-and-button">
+                  <input
+                    type="text"
+                    class="remote-input"
+                    placeholder="Enter 9-Digit Peer ID or IP (e.g. 901-435-944 or 192.168.1.50)"
+                    bind:value={targetAddress}
+                    onkeypress={handleKeypressConnect}
+                  />
+                  <button
+                    class="btn-connect-primary"
+                    disabled={isConnecting || !targetAddress.trim()}
+                    onclick={connectToRemote}
+                  >
+                    {#if isConnecting}
+                      <span class="btn-spinner"></span>
+                      <span>Connecting...</span>
+                    {:else}
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <line x1="5" y1="12" x2="19" y2="12"></line>
+                        <polyline points="12 5 19 12 12 19"></polyline>
+                      </svg>
+                      <span>Connect</span>
+                    {/if}
+                  </button>
+                </div>
+
+                {#if connectionError}
+                  <div class="inline-error">
+                    <span>⚠</span> {connectionError}
+                  </div>
+                {/if}
+
+                <!-- Quick Localhost Loopback Shortcut -->
+                <div class="quick-targets">
+                  <span class="quick-label">Quick Loopback:</span>
+                  <button
+                    class="quick-pill"
+                    onclick={() => { targetAddress = "127.0.0.1:44321"; connectToRemote(); }}
+                  >
+                    127.0.0.1:44321
+                  </button>
+                </div>
+              </div>
+
+              <div class="desk-footer security-note">
+                <div class="feature-tag">
+                  <span class="feature-icon">⚡</span> Sub-10ms Input Response
+                </div>
+                <div class="feature-tag">
+                  <span class="feature-icon">🛡</span> Direct P2P Encryption
+                </div>
               </div>
             </div>
           </div>
-        </div>
 
-        <!-- Recent Sessions / History Section -->
-        {#if recentSessions.length > 0}
-          <div class="recent-sessions-card">
-            <div class="recent-card-header">
-              <div class="recent-title-group">
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
-                  <circle cx="12" cy="12" r="10"></circle>
-                  <polyline points="12 6 12 12 16 14"></polyline>
-                </svg>
-                <span class="recent-heading">RECENT SESSIONS</span>
-                <span class="recent-badge">{recentSessions.length}</span>
+          <!-- Recent Sessions / History Section -->
+          {#if recentSessions.length > 0}
+            <div class="recent-sessions-card">
+              <div class="recent-card-header">
+                <div class="recent-title-group">
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <polyline points="12 6 12 12 16 14"></polyline>
+                  </svg>
+                  <span class="recent-heading">RECENT SESSIONS</span>
+                  <span class="recent-badge">{recentSessions.length}</span>
+                </div>
+              </div>
+
+              <div class="recent-chips-container">
+                {#each recentSessions as session}
+                  <div class="recent-chip">
+                    <div class="recent-chip-left" onclick={() => connectRecent(session.peer_id)} role="button" tabindex="0" onkeypress={(e) => e.key === 'Enter' && connectRecent(session.peer_id)}>
+                      <div class="recent-icon-box">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                          <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                          <line x1="8" y1="21" x2="16" y2="21"></line>
+                          <line x1="12" y1="17" x2="12" y2="21"></line>
+                        </svg>
+                      </div>
+                      <div class="recent-text-group">
+                        <span class="recent-chip-id">{session.alias || session.peer_id}</span>
+                        <span class="recent-chip-time">{formatTimeAgo(session.last_connected_at)}</span>
+                      </div>
+                    </div>
+
+                    <div class="recent-chip-right">
+                      <button class="btn-chip-connect" onclick={() => connectRecent(session.peer_id)} title="Connect">
+                        Connect
+                      </button>
+                      <button class="btn-chip-remove" onclick={() => removeRecentSession(session.peer_id)} title="Remove">
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                {/each}
               </div>
             </div>
+          {/if}
+        {:else if activeDashboardTab === "permissions"}
+          <!-- Dedicated Permissions Tab View -->
+          <div class="permissions-tab-container">
+            <!-- Active Connection Security Status Card -->
+            <div class="perm-section-card">
+              <div class="card-caption">
+                <span class="section-label">LIVE SESSION ACCESS</span>
+                <h2 class="card-heading">Active Connection Controls</h2>
+              </div>
 
-            <div class="recent-chips-container">
-              {#each recentSessions as session}
-                <div class="recent-chip">
-                  <div class="recent-chip-left" onclick={() => connectRecent(session.peer_id)} role="button" tabindex="0" onkeypress={(e) => e.key === 'Enter' && connectRecent(session.peer_id)}>
-                    <div class="recent-icon-box">
-                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-                        <line x1="8" y1="21" x2="16" y2="21"></line>
-                        <line x1="12" y1="17" x2="12" y2="21"></line>
-                      </svg>
-                    </div>
-                    <div class="recent-text-group">
-                      <span class="recent-chip-id">{session.alias || session.peer_id}</span>
-                      <span class="recent-chip-time">{formatTimeAgo(session.last_connected_at)}</span>
+              {#if hostSession && hostSession.is_active}
+                <div class="active-session-panel">
+                  <div class="session-connected-alert">
+                    <span class="pulse-indicator"></span>
+                    <div class="session-peer-details">
+                      <span class="session-title">Remote Partner Connected</span>
+                      <span class="session-sub">Peer ID: <strong>{hostSession.client_peer_id || "Direct Client"}</strong> • IP: {hostSession.client_ip || "Direct LAN"}</span>
                     </div>
                   </div>
 
-                  <div class="recent-chip-right">
-                    <button class="btn-chip-connect" onclick={() => connectRecent(session.peer_id)} title="Connect">
-                      Connect
+                  <p class="section-desc">
+                    Switch access mode dynamically in real-time. Changes apply instantly without dropping the video feed:
+                  </p>
+
+                  <div class="perm-options-grid">
+                    <button
+                      class="perm-option-card"
+                      class:active={hostSession.access_level === "ViewOnly"}
+                      onclick={() => updateHostAccessLevel("ViewOnly")}
+                    >
+                      <div class="perm-option-header">
+                        <span class="perm-badge-icon">🔒</span>
+                        <span class="perm-option-title">Screen Share (View Only)</span>
+                      </div>
+                      <p class="perm-option-desc">Remote partner can only observe your screen. All mouse clicks, typing, and gestures are blocked.</p>
                     </button>
-                    <button class="btn-chip-remove" onclick={() => removeRecentSession(session.peer_id)} title="Remove">
-                      ✕
+
+                    <button
+                      class="perm-option-card"
+                      class:active={hostSession.access_level === "Standard"}
+                      onclick={() => updateHostAccessLevel("Standard")}
+                    >
+                      <div class="perm-option-header">
+                        <span class="perm-badge-icon">⚡</span>
+                        <span class="perm-option-title">Standard (Interactive)</span>
+                      </div>
+                      <p class="perm-option-desc">Allows mouse pointer control, clicks, and keyboard typing. Ideal for paired work and standard remote support.</p>
+                    </button>
+
+                    <button
+                      class="perm-option-card"
+                      class:active={hostSession.access_level === "FullAccess"}
+                      onclick={() => updateHostAccessLevel("FullAccess")}
+                    >
+                      <div class="perm-option-header">
+                        <span class="perm-badge-icon">🛡</span>
+                        <span class="perm-option-title">Full Access</span>
+                      </div>
+                      <p class="perm-option-desc">Complete interactive remote control with all input capabilities and monitor switching unlocked.</p>
                     </button>
                   </div>
                 </div>
-              {/each}
+              {:else}
+                <div class="no-session-empty">
+                  <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
+                  </svg>
+                  <span>No remote partner is currently connected to this host.</span>
+                </div>
+              {/if}
+            </div>
+
+            <!-- Default Permission Policy Card -->
+            <div class="perm-section-card">
+              <div class="card-caption">
+                <span class="section-label">DEFAULT ACCESS POLICY</span>
+                <h2 class="card-heading">Default Mode for Incoming Connections</h2>
+              </div>
+              <p class="section-desc">
+                Choose the pre-selected permission level that will be proposed when a new incoming connection dialog appears:
+              </p>
+
+              <div class="perm-options-grid">
+                <button
+                  class="perm-option-card"
+                  class:active={(hostSession?.default_access_level || "Standard") === "ViewOnly"}
+                  onclick={() => updateDefaultAccessLevel("ViewOnly")}
+                >
+                  <div class="perm-option-header">
+                    <span class="perm-badge-icon">🔒</span>
+                    <span class="perm-option-title">Screen Share (View Only)</span>
+                  </div>
+                  <p class="perm-option-desc">Pre-selects view-only access by default for incoming requests.</p>
+                </button>
+
+                <button
+                  class="perm-option-card"
+                  class:active={(hostSession?.default_access_level || "Standard") === "Standard"}
+                  onclick={() => updateDefaultAccessLevel("Standard")}
+                >
+                  <div class="perm-option-header">
+                    <span class="perm-badge-icon">⚡</span>
+                    <span class="perm-option-title">Standard (Interactive)</span>
+                  </div>
+                  <p class="perm-option-desc">Pre-selects mouse and keyboard control (Recommended).</p>
+                </button>
+
+                <button
+                  class="perm-option-card"
+                  class:active={(hostSession?.default_access_level || "Standard") === "FullAccess"}
+                  onclick={() => updateDefaultAccessLevel("FullAccess")}
+                >
+                  <div class="perm-option-header">
+                    <span class="perm-badge-icon">🛡</span>
+                    <span class="perm-option-title">Full Access</span>
+                  </div>
+                  <p class="perm-option-desc">Pre-selects unrestricted full control mode.</p>
+                </button>
+              </div>
+            </div>
+          </div>
+        {:else if activeDashboardTab === "engine"}
+          <!-- Engine & Displays Tab View -->
+          <div class="engine-tab-container">
+            <div class="engine-section-card">
+              <div class="card-caption">
+                <span class="section-label">ATTACHED DISPLAYS</span>
+                <h2 class="card-heading">Local Monitor Configuration</h2>
+              </div>
+              <div class="monitors-list">
+                {#if availableMonitors.length > 0}
+                  {#each availableMonitors as mon}
+                    <div class="monitor-card" class:active={activeMonitorIndex === mon.index}>
+                      <div class="mon-left">
+                        <span class="mon-icon">🖥</span>
+                        <div>
+                          <div class="mon-name">{mon.name} {#if mon.is_primary}<span class="primary-badge">PRIMARY</span>{/if}</div>
+                          <div class="mon-res">{mon.width} x {mon.height}</div>
+                        </div>
+                      </div>
+                      <button
+                        class="btn-select-mon"
+                        class:selected={activeMonitorIndex === mon.index}
+                        onclick={() => switchMonitor(mon.index)}
+                      >
+                        {activeMonitorIndex === mon.index ? "Active Stream" : "Switch Display"}
+                      </button>
+                    </div>
+                  {/each}
+                {:else}
+                  <p class="text-muted">Primary Display (1920x1080)</p>
+                {/if}
+              </div>
             </div>
           </div>
         {/if}
@@ -1126,6 +1466,92 @@
             <span class="engine-bullet">●</span>
             <span class="engine-name">Channels:</span>
             <span class="engine-tech">UDP (Control) + TCP (Frames)</span>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Incoming Connection Request Modal Dialog -->
+    {#if showIncomingModal && incomingRequest}
+      <div class="modal-backdrop">
+        <div class="modal-card">
+          <div class="modal-header">
+            <div class="modal-badge-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                <circle cx="8.5" cy="7" r="4"></circle>
+                <line x1="20" y1="8" x2="20" y2="14"></line>
+                <line x1="23" y1="11" x2="17" y2="11"></line>
+              </svg>
+            </div>
+            <div>
+              <h3 class="modal-title">Incoming Connection Request</h3>
+              <p class="modal-subtitle">A remote device wants to connect to this computer</p>
+            </div>
+          </div>
+
+          <div class="modal-details">
+            <div class="detail-row">
+              <span class="detail-key">Remote Peer ID:</span>
+              <span class="detail-val">{incomingRequest.client_peer_id}</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-key">Remote IP Address:</span>
+              <span class="detail-val">{incomingRequest.client_ip}</span>
+            </div>
+          </div>
+
+          <div class="modal-permission-section">
+            <span class="section-label">GRANT PERMISSION LEVEL:</span>
+            <div class="perm-cards-list">
+              <button
+                type="button"
+                class="perm-choice-card"
+                class:selected={selectedIncomingPermission === "ViewOnly"}
+                onclick={() => (selectedIncomingPermission = "ViewOnly")}
+              >
+                <div class="choice-title">
+                  <span class="choice-icon">🔒</span>
+                  <span>Screen Share (View Only)</span>
+                </div>
+                <div class="choice-desc">Remote user can only watch your screen. Mouse clicks and typing are strictly blocked.</div>
+              </button>
+
+              <button
+                type="button"
+                class="perm-choice-card"
+                class:selected={selectedIncomingPermission === "Standard"}
+                onclick={() => (selectedIncomingPermission = "Standard")}
+              >
+                <div class="choice-title">
+                  <span class="choice-icon">⚡</span>
+                  <span>Standard (Default)</span>
+                </div>
+                <div class="choice-desc">Allows remote mouse clicks and keyboard typing for interactive assistance.</div>
+              </button>
+
+              <button
+                type="button"
+                class="perm-choice-card"
+                class:selected={selectedIncomingPermission === "FullAccess"}
+                onclick={() => (selectedIncomingPermission = "FullAccess")}
+              >
+                <div class="choice-title">
+                  <span class="choice-icon">🛡</span>
+                  <span>Full Access</span>
+                </div>
+                <div class="choice-desc">Complete unrestricted control of mouse, keyboard, and display switching.</div>
+              </button>
+            </div>
+          </div>
+
+          <div class="modal-actions">
+            <button class="btn-decline" onclick={declineIncomingConnection}>
+              Decline
+            </button>
+            <button class="btn-accept" onclick={acceptIncomingConnection}>
+              Accept & Start Sharing
+            </button>
           </div>
         </div>
       </div>
@@ -1924,12 +2350,407 @@
       padding: 5px 8px;
       font-size: 0.85rem;
     }
-    .quick-connect-form {
-      flex-direction: column;
-    }
     .btn-connect-primary {
       width: 100%;
       justify-content: center;
     }
+  }
+
+  /* HUD Permission Badge */
+  .permission-badge {
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 0.72rem;
+    font-weight: 700;
+  }
+  .badge-viewonly {
+    background: rgba(234, 179, 8, 0.2);
+    color: #facc15;
+    border: 1px solid rgba(250, 204, 21, 0.4);
+  }
+  .badge-standard {
+    background: rgba(56, 189, 248, 0.2);
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.4);
+  }
+  .badge-full {
+    background: rgba(34, 197, 94, 0.2);
+    color: #4ade80;
+    border: 1px solid rgba(74, 222, 128, 0.4);
+  }
+
+  /* Dashboard Tabs */
+  .dashboard-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    padding-bottom: 10px;
+  }
+  .tab-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #94a3b8;
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    position: relative;
+  }
+  .tab-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #f1f5f9;
+  }
+  .tab-btn.active {
+    background: rgba(56, 189, 248, 0.15);
+    color: #38bdf8;
+    border-color: rgba(56, 189, 248, 0.35);
+  }
+  .active-session-indicator {
+    color: #22c55e;
+    font-size: 0.75rem;
+    animation: pulse 1.5s infinite;
+  }
+
+  /* Permissions Tab Layout */
+  .permissions-tab-container,
+  .engine-tab-container {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .perm-section-card,
+  .engine-section-card {
+    background: rgba(15, 23, 42, 0.65);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 20px;
+    backdrop-filter: blur(12px);
+  }
+  .section-desc {
+    font-size: 0.85rem;
+    color: #94a3b8;
+    margin: 8px 0 16px 0;
+    line-height: 1.4;
+  }
+  .perm-options-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 12px;
+  }
+  .perm-option-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 16px;
+    text-align: left;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .perm-option-card:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.15);
+  }
+  .perm-option-card.active {
+    background: rgba(56, 189, 248, 0.12);
+    border-color: #38bdf8;
+    box-shadow: 0 0 15px rgba(56, 189, 248, 0.2);
+  }
+  .perm-option-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .perm-badge-icon {
+    font-size: 1.2rem;
+  }
+  .perm-option-title {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: #f1f5f9;
+  }
+  .perm-option-desc {
+    margin: 0;
+    font-size: 0.8rem;
+    color: #94a3b8;
+    line-height: 1.35;
+  }
+  .active-session-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .session-connected-alert {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    background: rgba(34, 197, 94, 0.1);
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    border-radius: 8px;
+  }
+  .pulse-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #22c55e;
+    box-shadow: 0 0 8px #22c55e;
+    animation: pulse 1.5s infinite;
+  }
+  .session-title {
+    display: block;
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: #4ade80;
+  }
+  .session-sub {
+    font-size: 0.8rem;
+    color: #94a3b8;
+  }
+  .no-session-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 36px 16px;
+    color: #64748b;
+    font-size: 0.9rem;
+  }
+
+  /* Engine Displays List */
+  .monitors-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .monitor-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+  }
+  .monitor-card.active {
+    border-color: rgba(56, 189, 248, 0.4);
+    background: rgba(56, 189, 248, 0.05);
+  }
+  .mon-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .mon-icon {
+    font-size: 1.4rem;
+  }
+  .mon-name {
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #f1f5f9;
+  }
+  .primary-badge {
+    font-size: 0.65rem;
+    background: #0284c7;
+    color: white;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+  }
+  .mon-res {
+    font-size: 0.78rem;
+    color: #94a3b8;
+  }
+  .btn-select-mon {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: #f1f5f9;
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .btn-select-mon.selected {
+    background: #0284c7;
+    border-color: #38bdf8;
+    color: #fff;
+  }
+
+  /* Modal Backdrop & Card */
+  .modal-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(8px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    animation: fadeIn 0.15s ease-out;
+  }
+  .modal-card {
+    background: #0f172a;
+    border: 1px solid rgba(56, 189, 248, 0.3);
+    border-radius: 14px;
+    width: 90%;
+    max-width: 520px;
+    padding: 24px;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6), 0 0 20px rgba(56, 189, 248, 0.15);
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .modal-header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .modal-badge-icon {
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    background: rgba(56, 189, 248, 0.15);
+    color: #38bdf8;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .modal-title {
+    margin: 0;
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: #f8fafc;
+  }
+  .modal-subtitle {
+    margin: 2px 0 0 0;
+    font-size: 0.8rem;
+    color: #94a3b8;
+  }
+  .modal-details {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .detail-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.82rem;
+  }
+  .detail-key {
+    color: #94a3b8;
+  }
+  .detail-val {
+    font-family: monospace;
+    font-weight: 600;
+    color: #f1f5f9;
+  }
+  .modal-permission-section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .perm-cards-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .perm-choice-card {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 12px 14px;
+    text-align: left;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .perm-choice-card:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .perm-choice-card.selected {
+    background: rgba(56, 189, 248, 0.15);
+    border-color: #38bdf8;
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.2);
+  }
+  .choice-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    font-size: 0.88rem;
+    color: #f1f5f9;
+  }
+  .choice-icon {
+    font-size: 1rem;
+  }
+  .choice-desc {
+    margin-top: 4px;
+    font-size: 0.76rem;
+    color: #94a3b8;
+    line-height: 1.3;
+  }
+  .modal-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 6px;
+  }
+  .btn-decline {
+    flex: 1;
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #f87171;
+    padding: 10px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.88rem;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  .btn-decline:hover {
+    background: rgba(239, 68, 68, 0.25);
+  }
+  .btn-accept {
+    flex: 2;
+    background: #0284c7;
+    border: 1px solid #38bdf8;
+    color: #ffffff;
+    padding: 10px;
+    border-radius: 8px;
+    font-weight: 700;
+    font-size: 0.88rem;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    box-shadow: 0 2px 10px rgba(2, 132, 199, 0.4);
+  }
+  .btn-accept:hover {
+    background: #0369a1;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: scale(0.97); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
   }
 </style>

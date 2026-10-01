@@ -1,14 +1,18 @@
-use app_common::{InputEvent, SignalingMessage};
+use app_common::{
+    AccessLevel, ConnectionHandshakeRequest, ConnectionHandshakeResponse,
+    IncomingRequestInfo, InputEvent, SignalingMessage,
+};
 use core_capture::ScreenCapturer;
 use core_codec::FrameEncoder;
 use core_input::InputInjector;
+use futures_util::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
@@ -24,6 +28,8 @@ pub enum NetError {
     Codec(String),
     #[error("Peer not found on local network: {0}")]
     PeerNotFound(String),
+    #[error("Connection declined: {0}")]
+    ConnectionDeclined(String),
 }
 
 pub const DISCOVERY_PORT: u16 = 44320;
@@ -177,6 +183,10 @@ pub async fn bind_tcp_reuse(addr: SocketAddr) -> Result<TcpListener, NetError> {
     unreachable!()
 }
 
+pub type RequestPromptCallback = Arc<
+    dyn Fn(IncomingRequestInfo) -> BoxFuture<'static, (bool, AccessLevel)> + Send + Sync,
+>;
+
 /// Host Direct LAN Server: binds local ports and listens for direct peer connections
 pub struct DirectLanHost {
     pub peer_id: String,
@@ -185,6 +195,10 @@ pub struct DirectLanHost {
     injector: Arc<InputInjector>,
     capturer: Arc<ScreenCapturer>,
     tasks: Arc<parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    access_level: Arc<parking_lot::RwLock<AccessLevel>>,
+    default_access_level: Arc<parking_lot::RwLock<AccessLevel>>,
+    active_client: Arc<parking_lot::RwLock<Option<(String, String)>>>,
+    prompt_callback: Arc<parking_lot::Mutex<Option<RequestPromptCallback>>>,
 }
 
 impl DirectLanHost {
@@ -200,7 +214,38 @@ impl DirectLanHost {
             injector: Arc::new(InputInjector::new()),
             capturer,
             tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            access_level: Arc::new(parking_lot::RwLock::new(AccessLevel::Standard)),
+            default_access_level: Arc::new(parking_lot::RwLock::new(AccessLevel::Standard)),
+            active_client: Arc::new(parking_lot::RwLock::new(None)),
+            prompt_callback: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    pub fn access_level(&self) -> AccessLevel {
+        *self.access_level.read()
+    }
+
+    pub fn set_access_level(&self, level: AccessLevel) {
+        *self.access_level.write() = level;
+    }
+
+    pub fn default_access_level(&self) -> AccessLevel {
+        *self.default_access_level.read()
+    }
+
+    pub fn set_default_access_level(&self, level: AccessLevel) {
+        *self.default_access_level.write() = level;
+    }
+
+    pub fn active_client(&self) -> Option<(String, String)> {
+        self.active_client.read().clone()
+    }
+
+    pub fn set_prompt_callback<F>(&self, callback: F)
+    where
+        F: Fn(IncomingRequestInfo) -> BoxFuture<'static, (bool, AccessLevel)> + Send + Sync + 'static,
+    {
+        *self.prompt_callback.lock() = Some(Arc::new(callback));
     }
 
     /// Starts the background listener for incoming control events over direct LAN UDP with socket reuse
@@ -211,6 +256,7 @@ impl DirectLanHost {
         let socket = bind_udp_reuse(addr).await?;
         let injector = Arc::clone(&self.injector);
         let capturer = Arc::clone(&self.capturer);
+        let access_level_lock = Arc::clone(&self.access_level);
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
@@ -218,16 +264,32 @@ impl DirectLanHost {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, _peer_addr)) => {
                         if let Ok(event) = serde_json::from_slice::<InputEvent>(&buf[..len]) {
-                            match &event {
-                                InputEvent::SwitchMonitor { monitor_index } => {
-                                    let _ = capturer.switch_monitor(*monitor_index);
-                                    let monitors = ScreenCapturer::enumerate_monitors();
-                                    if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
-                                        injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
+                            let current_level = *access_level_lock.read();
+                            match current_level {
+                                AccessLevel::ViewOnly => {
+                                    // In ViewOnly mode, discard all clicks, movements, keystrokes and scrolls.
+                                    // Allow monitor switching so remote viewer can inspect attached displays.
+                                    if let InputEvent::SwitchMonitor { monitor_index } = &event {
+                                        let _ = capturer.switch_monitor(*monitor_index);
+                                        let monitors = ScreenCapturer::enumerate_monitors();
+                                        if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
+                                            injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
+                                        }
                                     }
                                 }
-                                _ => {
-                                    let _ = injector.inject(&event);
+                                AccessLevel::Standard | AccessLevel::FullAccess => {
+                                    match &event {
+                                        InputEvent::SwitchMonitor { monitor_index } => {
+                                            let _ = capturer.switch_monitor(*monitor_index);
+                                            let monitors = ScreenCapturer::enumerate_monitors();
+                                            if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
+                                                injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
+                                            }
+                                        }
+                                        _ => {
+                                            let _ = injector.inject(&event);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -248,15 +310,90 @@ impl DirectLanHost {
             .map_err(|e: std::net::AddrParseError| NetError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
         let listener = bind_tcp_reuse(addr).await?;
         let capturer = Arc::clone(&self.capturer);
+        let prompt_callback = Arc::clone(&self.prompt_callback);
+        let access_level = Arc::clone(&self.access_level);
+        let default_access_level = Arc::clone(&self.default_access_level);
+        let active_client = Arc::clone(&self.active_client);
 
         let handle = tokio::spawn(async move {
             loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
+                if let Ok((mut stream, peer_addr)) = listener.accept().await {
                     let _ = stream.set_nodelay(true);
                     let cap = Arc::clone(&capturer);
+                    let cb_opt = prompt_callback.lock().clone();
+                    let access_lvl_clone = Arc::clone(&access_level);
+                    let def_access_lvl = *default_access_level.read();
+                    let active_client_clone = Arc::clone(&active_client);
                     let enc = FrameEncoder::new();
 
                     tokio::spawn(async move {
+                        // 1. Read Client Handshake Request
+                        let mut req_len_buf = [0u8; 4];
+                        if tokio::time::timeout(tokio::time::Duration::from_secs(10), stream.read_exact(&mut req_len_buf)).await.is_err() {
+                            return;
+                        }
+                        let req_len = u32::from_be_bytes(req_len_buf) as usize;
+                        if req_len > 65535 {
+                            return;
+                        }
+                        let mut req_buf = vec![0u8; req_len];
+                        if stream.read_exact(&mut req_buf).await.is_err() {
+                            return;
+                        }
+                        let handshake_req: ConnectionHandshakeRequest = match serde_json::from_slice(&req_buf) {
+                            Ok(r) => r,
+                            Err(_) => return,
+                        };
+
+                        let client_peer_id = handshake_req.client_peer_id;
+                        let client_ip = peer_addr.ip().to_string();
+                        let request_id = format!(
+                            "{}-{}",
+                            client_peer_id,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis()
+                        );
+
+                        // 2. Obtain Host decision
+                        let (accepted, chosen_level) = if let Some(cb) = cb_opt {
+                            let info = IncomingRequestInfo {
+                                request_id,
+                                client_peer_id: client_peer_id.clone(),
+                                client_ip: client_ip.clone(),
+                            };
+                            cb(info).await
+                        } else {
+                            (true, def_access_lvl)
+                        };
+
+                        // 3. Send Handshake Response
+                        let resp = ConnectionHandshakeResponse {
+                            accepted,
+                            access_level: chosen_level,
+                            reason: if accepted {
+                                None
+                            } else {
+                                Some("Connection request declined by host".to_string())
+                            },
+                        };
+                        let resp_bytes = serde_json::to_vec(&resp).unwrap_or_default();
+                        let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+                        if stream.write_all(&resp_len).await.is_err() || stream.write_all(&resp_bytes).await.is_err() {
+                            return;
+                        }
+
+                        if !accepted {
+                            let _ = stream.shutdown().await;
+                            return;
+                        }
+
+                        // Session is accepted: record active state
+                        *access_lvl_clone.write() = chosen_level;
+                        *active_client_clone.write() = Some((client_peer_id.clone(), client_ip.clone()));
+
+                        // 4. Video Streaming loop
                         let mut last_seq = 0u64;
                         let mut last_monitor = cap.active_monitor_index();
                         let mut send_monitors = true;
@@ -285,6 +422,7 @@ impl DirectLanHost {
                                                 compressed.meta.active_monitor = Some(current_mon);
                                                 send_monitors = false;
                                             }
+                                            compressed.meta.access_level = Some(*access_lvl_clone.read());
 
                                             let meta_bytes = serde_json::to_vec(&compressed.meta).unwrap_or_default();
                                             let meta_len = meta_bytes.len() as u32;
@@ -317,6 +455,8 @@ impl DirectLanHost {
 
                             tokio::time::sleep(tokio::time::Duration::from_millis(4)).await;
                         }
+
+                        *active_client_clone.write() = None;
                     });
                 }
             }
@@ -542,15 +682,21 @@ pub fn stop_background_client_discovery() {
 
 /// Controller Direct LAN Client: connects directly to a target IP:Port over the local network
 pub struct DirectLanClient {
-    target_addr: SocketAddr,
+    pub target_addr: SocketAddr,
+    pub my_peer_id: String,
     control_socket: UdpSocket,
 }
 
 impl DirectLanClient {
     pub async fn connect(target_addr: SocketAddr) -> Result<Self, NetError> {
+        Self::connect_with_peer_id(target_addr, app_common::PeerId::load_or_create().0).await
+    }
+
+    pub async fn connect_with_peer_id(target_addr: SocketAddr, my_peer_id: String) -> Result<Self, NetError> {
         let control_socket = UdpSocket::bind("0.0.0.0:0").await?;
         Ok(Self {
             target_addr,
+            my_peer_id,
             control_socket,
         })
     }
@@ -561,11 +707,45 @@ impl DirectLanClient {
         Ok(())
     }
 
-    pub async fn connect_video_stream(&self) -> Result<TcpStream, NetError> {
+    pub async fn connect_video_stream(&self) -> Result<(TcpStream, AccessLevel), NetError> {
         let video_addr = SocketAddr::new(self.target_addr.ip(), self.target_addr.port() + 1);
-        let stream = TcpStream::connect(video_addr).await?;
+        let mut stream = TcpStream::connect(video_addr).await?;
         let _ = stream.set_nodelay(true);
-        Ok(stream)
+
+        // Send Handshake Request
+        let req = ConnectionHandshakeRequest {
+            client_peer_id: self.my_peer_id.clone(),
+            client_name: None,
+        };
+        let req_bytes = serde_json::to_vec(&req)?;
+        let req_len = (req_bytes.len() as u32).to_be_bytes();
+        stream.write_all(&req_len).await?;
+        stream.write_all(&req_bytes).await?;
+
+        // Read Handshake Response (wait up to 65s for Host user to accept)
+        let mut resp_len_buf = [0u8; 4];
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(65),
+            stream.read_exact(&mut resp_len_buf),
+        )
+        .await
+        .map_err(|_| {
+            NetError::ConnectionDeclined("Connection request timed out waiting for host response".to_string())
+        })??;
+
+        let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        stream.read_exact(&mut resp_buf).await?;
+        let resp: ConnectionHandshakeResponse = serde_json::from_slice(&resp_buf)?;
+
+        if !resp.accepted {
+            return Err(NetError::ConnectionDeclined(
+                resp.reason
+                    .unwrap_or_else(|| "Connection was declined by the remote host".to_string()),
+            ));
+        }
+
+        Ok((stream, resp.access_level))
     }
 }
 

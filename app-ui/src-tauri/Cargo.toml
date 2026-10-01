@@ -21,6 +21,7 @@ base64 = "0.22"
 local-ip-address = "0.6"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
+parking_lot = "0.12"
 
 # Workspace core dependencies
 app-common = { path = "../../crates/app-common" }

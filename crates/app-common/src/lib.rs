@@ -265,6 +265,50 @@ pub enum MouseButton {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccessLevel {
+    ViewOnly,
+    Standard,
+    FullAccess,
+}
+
+impl Default for AccessLevel {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionHandshakeRequest {
+    pub client_peer_id: String,
+    #[serde(default)]
+    pub client_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionHandshakeResponse {
+    pub accepted: bool,
+    pub access_level: AccessLevel,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingRequestInfo {
+    pub request_id: String,
+    pub client_peer_id: String,
+    pub client_ip: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostSessionInfo {
+    pub is_active: bool,
+    pub client_peer_id: Option<String>,
+    pub client_ip: Option<String>,
+    pub access_level: AccessLevel,
+    pub default_access_level: AccessLevel,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameMeta {
     pub width: u32,
@@ -283,6 +327,8 @@ pub struct FrameMeta {
     pub monitors: Option<Vec<MonitorDescriptor>>,
     #[serde(default)]
     pub active_monitor: Option<usize>,
+    #[serde(default)]
+    pub access_level: Option<AccessLevel>,
 }
 
 /// Signaling protocol envelope

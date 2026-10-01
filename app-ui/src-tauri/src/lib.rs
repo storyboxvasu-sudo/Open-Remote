@@ -1,15 +1,19 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
-use app_common::{InputEvent, MonitorDescriptor, PeerConfig, PeerId, RecentSession};
+use app_common::{
+    AccessLevel, HostSessionInfo, IncomingRequestInfo, InputEvent,
+    MonitorDescriptor, PeerConfig, PeerId, RecentSession,
+};
 use core_capture::ScreenCapturer;
 use core_codec::FrameEncoder;
 use core_net::{read_remote_frame, resolve_target_address, DirectLanClient, DirectLanHost};
@@ -39,6 +43,7 @@ pub struct ClientConnectResult {
     pub local_ws_port: u16,
     pub target_ip: String,
     pub message: String,
+    pub initial_access_level: AccessLevel,
 }
 
 pub struct ActiveHost {
@@ -91,6 +96,9 @@ pub struct AppEngineState {
     pub capturer: Arc<ScreenCapturer>,
     pub host: Arc<Mutex<Option<ActiveHost>>>,
     pub client: Arc<Mutex<Option<ActiveClient>>>,
+    pub app_handle: Arc<parking_lot::Mutex<Option<tauri::AppHandle>>>,
+    pub pending_requests: Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<(bool, AccessLevel)>>>>,
+    pub default_access_level: Arc<parking_lot::RwLock<AccessLevel>>,
 }
 
 impl AppEngineState {
@@ -112,7 +120,14 @@ impl AppEngineState {
             capturer,
             host: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
+            app_handle: Arc::new(parking_lot::Mutex::new(None)),
+            pending_requests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            default_access_level: Arc::new(parking_lot::RwLock::new(AccessLevel::Standard)),
         }
+    }
+
+    pub fn set_app_handle(&self, handle: tauri::AppHandle) {
+        *self.app_handle.lock() = Some(handle);
     }
 }
 
@@ -133,6 +148,45 @@ async fn internal_start_hosting(
 
     let capturer = Arc::clone(&state.capturer);
     let host_net = Arc::new(DirectLanHost::with_peer_id(port, state.peer_id.clone(), Arc::clone(&capturer)));
+    host_net.set_default_access_level(*state.default_access_level.read());
+
+    // Hook prompt callback for incoming connection requests
+    let app_handle_opt = Arc::clone(&state.app_handle);
+    let pending_requests_map = Arc::clone(&state.pending_requests);
+    let def_level_lock = Arc::clone(&state.default_access_level);
+
+    host_net.set_prompt_callback(move |info: IncomingRequestInfo| {
+        let app_handle_opt = Arc::clone(&app_handle_opt);
+        let pending_requests_map = Arc::clone(&pending_requests_map);
+        let def_level = *def_level_lock.read();
+
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            pending_requests_map.lock().insert(info.request_id.clone(), tx);
+
+            if let Some(app) = app_handle_opt.lock().as_ref() {
+                // Restore & focus host window so user notices the connection request dialog
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+                let _ = app.emit("incoming-connection-request", &info);
+            }
+
+            // Wait for user to Accept or Decline (60s timeout)
+            match tokio::time::timeout(tokio::time::Duration::from_secs(60), rx).await {
+                Ok(Ok((accepted, access_level))) => {
+                    pending_requests_map.lock().remove(&info.request_id);
+                    (accepted, access_level)
+                }
+                _ => {
+                    pending_requests_map.lock().remove(&info.request_id);
+                    (false, def_level)
+                }
+            }
+        })
+    });
 
     host_net
         .start_input_listener()
@@ -231,10 +285,16 @@ async fn connect_to_remote(
         .await
         .map_err(|e| e)?;
 
-    let client = DirectLanClient::connect(target_addr)
+    let client = DirectLanClient::connect_with_peer_id(target_addr, my_id)
         .await
         .map_err(|e| format!("Failed to initialize connection to {}: {:?}", target_addr, e))?;
     let client_arc = Arc::new(client);
+
+    // Perform handshake and connect video stream
+    let (mut video_stream, initial_access_level) = client_arc
+        .connect_video_stream()
+        .await
+        .map_err(|e| format!("{}", e))?;
 
     // Save successfully connected Peer ID or IP in recent history
     let mut config = PeerConfig::load();
@@ -251,24 +311,19 @@ async fn connect_to_remote(
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_clone = Arc::clone(&stop_flag);
-    let client_for_stream = Arc::clone(&client_arc);
 
     let bridge_task = tokio::spawn(async move {
-        let mut video_stream = match client_for_stream.connect_video_stream().await {
-            Ok(s) => {
-                let _ = s.set_nodelay(true);
-                s
-            }
-            Err(e) => {
-                eprintln!("[open-remote] Failed to connect to remote video stream: {:?}", e);
-                return;
-            }
-        };
-
         if let Ok((raw_stream, _)) = ws_listener.accept().await {
             let _ = raw_stream.set_nodelay(true);
             if let Ok(mut ws_stream) = accept_async(raw_stream).await {
                 let encoder = FrameEncoder::new();
+
+                // Send initial permission notification to client frontend
+                let init_perm_json = serde_json::to_string(&serde_json::json!({
+                    "type": "permission_update",
+                    "access_level": initial_access_level,
+                })).unwrap_or_default();
+                let _ = ws_stream.send(Message::Text(init_perm_json.into())).await;
 
                 while !stop_flag_clone.load(Ordering::Relaxed) {
                     match read_remote_frame(&mut video_stream, &encoder).await {
@@ -295,6 +350,15 @@ async fn connect_to_remote(
                                     "active_display_id": meta.active_monitor.unwrap_or(1),
                                 })).unwrap_or_default();
                                 let _ = ws_stream.send(Message::Text(manifest_json.into())).await;
+                            }
+
+                            // Forward live permission updates from host
+                            if let Some(lvl) = meta.access_level {
+                                let perm_json = serde_json::to_string(&serde_json::json!({
+                                    "type": "permission_update",
+                                    "access_level": lvl,
+                                })).unwrap_or_default();
+                                let _ = ws_stream.send(Message::Text(perm_json.into())).await;
                             }
 
                             // Optimized Packet structure with dirty rect header (36 bytes header + pixels):
@@ -337,7 +401,93 @@ async fn connect_to_remote(
         local_ws_port,
         target_ip: target_addr.to_string(),
         message: format!("Connected to {}", target_addr),
+        initial_access_level,
     })
+}
+
+#[tauri::command]
+async fn respond_connection_request(
+    request_id: String,
+    accept: bool,
+    access_level: AccessLevel,
+    state: State<'_, AppEngineState>,
+) -> Result<bool, String> {
+    let sender = state.pending_requests.lock().remove(&request_id);
+    if let Some(tx) = sender {
+        let _ = tx.send((accept, access_level));
+        if accept {
+            if let Some(app) = state.app_handle.lock().as_ref() {
+                let _ = app.emit("session-status-changed", ());
+            }
+        }
+        Ok(true)
+    } else {
+        Err("Connection request has expired or was already handled".to_string())
+    }
+}
+
+#[tauri::command]
+async fn set_session_access_level(
+    access_level: AccessLevel,
+    state: State<'_, AppEngineState>,
+) -> Result<bool, String> {
+    let host_guard = state.host.lock().await;
+    if let Some(ref host) = *host_guard {
+        host.host_net.set_access_level(access_level);
+        if let Some(app) = state.app_handle.lock().as_ref() {
+            let _ = app.emit("session-status-changed", ());
+        }
+        Ok(true)
+    } else {
+        Err("Host is not active".to_string())
+    }
+}
+
+#[tauri::command]
+async fn set_default_access_level(
+    access_level: AccessLevel,
+    state: State<'_, AppEngineState>,
+) -> Result<bool, String> {
+    *state.default_access_level.write() = access_level;
+    let host_guard = state.host.lock().await;
+    if let Some(ref host) = *host_guard {
+        host.host_net.set_default_access_level(access_level);
+    }
+    if let Some(app) = state.app_handle.lock().as_ref() {
+        let _ = app.emit("session-status-changed", ());
+    }
+    Ok(true)
+}
+
+#[tauri::command]
+async fn get_host_session_state(
+    state: State<'_, AppEngineState>,
+) -> Result<HostSessionInfo, String> {
+    let host_guard = state.host.lock().await;
+    let default_level = *state.default_access_level.read();
+    if let Some(ref host) = *host_guard {
+        let client_opt = host.host_net.active_client();
+        let access_level = host.host_net.access_level();
+        let (client_peer_id, client_ip) = match client_opt {
+            Some((id, ip)) => (Some(id), Some(ip)),
+            None => (None, None),
+        };
+        Ok(HostSessionInfo {
+            is_active: client_peer_id.is_some(),
+            client_peer_id,
+            client_ip,
+            access_level,
+            default_access_level: default_level,
+        })
+    } else {
+        Ok(HostSessionInfo {
+            is_active: false,
+            client_peer_id: None,
+            client_ip: None,
+            access_level: default_level,
+            default_access_level: default_level,
+        })
+    }
 }
 
 #[tauri::command]
@@ -533,6 +683,10 @@ pub fn run() {
 
             // Automatically and persistently start host listening server & discovery on boot via internal_start_hosting
             let app_handle = app.handle().clone();
+            {
+                let state = app_handle.state::<AppEngineState>();
+                state.set_app_handle(app_handle.clone());
+            }
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppEngineState>();
                 if let Err(e) = internal_start_hosting(&state, 44321).await {
@@ -640,6 +794,10 @@ pub fn run() {
             get_recent_sessions,
             save_recent_session,
             remove_recent_session,
+            respond_connection_request,
+            set_session_access_level,
+            set_default_access_level,
+            get_host_session_state,
             app_minimize,
             app_toggle_maximize,
             app_close,

@@ -1,4 +1,4 @@
-﻿use app_common::FrameMeta;
+use app_common::FrameMeta;
 use core_capture::RawFrame;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -95,6 +95,7 @@ impl FrameEncoder {
                     dirty_h: height,
                     monitors: None,
                     active_monitor: None,
+                    access_level: None,
                 },
                 payload: compressed,
             }));
@@ -149,6 +150,7 @@ impl FrameEncoder {
                 dirty_h,
                 monitors: None,
                 active_monitor: None,
+                access_level: None,
             },
             payload: compressed,
         }))
