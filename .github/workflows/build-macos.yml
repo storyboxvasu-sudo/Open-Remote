@@ -15,6 +15,10 @@ jobs:
   build-macos:
     name: Build macOS ${{ matrix.name }}
     runs-on: macos-14
+    env:
+      CC: clang
+      CXX: clang++
+      AR: ar
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +43,14 @@ jobs:
         run: |
           rustup target add ${{ matrix.target }}
 
+      - name: Verify macOS Toolchain
+        run: |
+          echo "=== Xcode Clang Version ==="
+          clang --version
+          which clang
+          echo "=== Installed Rust Targets ==="
+          rustup target list --installed
+
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
@@ -61,6 +73,9 @@ jobs:
         working-directory: app-ui
         env:
           RUST_BACKTRACE: 1
+          CC: clang
+          CXX: clang++
+          AR: ar
         run: |
           pnpm tauri build --target ${{ matrix.target }} --verbose
 
