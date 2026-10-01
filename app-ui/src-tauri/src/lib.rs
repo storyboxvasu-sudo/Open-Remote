@@ -469,7 +469,7 @@ fn app_start_dragging(#[allow(unused_variables)] window: tauri::Window) {
     let _ = window.start_dragging();
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn cleanup_orphaned_instances() {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -485,7 +485,7 @@ fn cleanup_orphaned_instances() {
         .output();
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn ensure_firewall_rules() {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -525,7 +525,7 @@ pub fn run() {
         .manage(app_state)
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            #[cfg(windows)]
+            #[cfg(target_os = "windows")]
             {
                 cleanup_orphaned_instances();
                 ensure_firewall_rules();
@@ -559,11 +559,16 @@ pub fn run() {
                     &quit_item,
                 ])?;
 
-                let _tray = tauri::tray::TrayIconBuilder::new()
-                    .icon(app.default_window_icon().unwrap().clone())
+                let mut tray_builder = tauri::tray::TrayIconBuilder::new()
                     .tooltip("OpenRemote - High Performance Remote Desktop")
                     .menu(&tray_menu)
-                    .show_menu_on_left_click(false)
+                    .show_menu_on_left_click(false);
+
+                if let Some(icon) = app.default_window_icon() {
+                    tray_builder = tray_builder.icon(icon.clone());
+                }
+
+                let _tray = tray_builder
                     .on_menu_event(|app, event| {
                         match event.id.as_ref() {
                             "open" => {

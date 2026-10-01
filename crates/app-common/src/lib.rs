@@ -155,7 +155,7 @@ impl PeerId {
     }
 
     /// Reads MachineGuid from the Windows registry if available
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     pub fn get_machine_guid() -> Option<String> {
         use winreg::enums::*;
         use winreg::RegKey;
@@ -169,7 +169,7 @@ impl PeerId {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "windows"))]
     pub fn get_machine_guid() -> Option<String> {
         None
     }

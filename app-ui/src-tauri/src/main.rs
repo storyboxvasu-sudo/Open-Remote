@@ -13,7 +13,7 @@ fn get_crash_log_path() -> PathBuf {
 }
 
 fn show_error_dialog(message: &str) {
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
@@ -29,7 +29,7 @@ fn show_error_dialog(message: &str) {
             );
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "windows"))]
     {
         eprintln!("{}", message);
     }

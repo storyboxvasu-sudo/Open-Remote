@@ -4,15 +4,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 use windows_capture::graphics_capture_api::InternalCaptureControl;
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 use windows_capture::monitor::Monitor;
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
@@ -41,12 +41,12 @@ pub(crate) struct CaptureShared {
     pub(crate) frame_counter: Arc<AtomicU64>,
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 struct FrameReceiverHandler {
     shared: CaptureShared,
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 impl GraphicsCaptureApiHandler for FrameReceiverHandler {
     type Flags = CaptureShared;
     type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -83,7 +83,7 @@ impl GraphicsCaptureApiHandler for FrameReceiverHandler {
     }
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 enum BackendControl {
     Wgc(CaptureControl<FrameReceiverHandler, Box<dyn std::error::Error + Send + Sync>>),
     Dxgi {
@@ -96,7 +96,7 @@ enum BackendControl {
     },
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 impl BackendControl {
     pub fn stop(self) {
         match self {
@@ -125,7 +125,7 @@ impl BackendControl {
     }
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn try_start_wgc(
     monitor: Monitor,
     shared: CaptureShared,
@@ -172,7 +172,7 @@ fn try_start_wgc(
     .and_then(|r| r)
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn try_start_dxgi(monitor: Monitor, shared: CaptureShared) -> Result<BackendControl, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut dup = DxgiDuplicationApi::new(monitor)
@@ -225,7 +225,7 @@ fn try_start_dxgi(monitor: Monitor, shared: CaptureShared) -> Result<BackendCont
     .and_then(|r| r)
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn start_gdi(x: i32, y: i32, width: u32, height: u32, shared: CaptureShared) -> BackendControl {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop_flag);
@@ -355,7 +355,7 @@ fn start_gdi(x: i32, y: i32, width: u32, height: u32, shared: CaptureShared) -> 
     }
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn enumerate_monitors_win32() -> Vec<MonitorDescriptor> {
     use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
     use windows_sys::Win32::Graphics::Gdi::{
@@ -443,6 +443,9 @@ pub mod macos_capture {
     pub type CFTypeRef = *const std::ffi::c_void;
 
     #[link(name = "CoreGraphics", kind = "framework")]
+    #[link(name = "ScreenCaptureKit", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         pub fn CGGetActiveDisplayList(
             max_displays: u32,
@@ -463,7 +466,6 @@ pub mod macos_capture {
         pub fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
     }
 
-    #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         pub fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
         pub fn CFDataGetLength(data: CFDataRef) -> isize;
@@ -631,7 +633,7 @@ pub mod macos_capture {
 
 pub struct ScreenCapturer {
     shared: CaptureShared,
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     control: Arc<Mutex<Option<BackendControl>>>,
     #[cfg(target_os = "macos")]
     control: Arc<Mutex<Option<macos_capture::MacOsControl>>>,
@@ -642,7 +644,7 @@ pub struct ScreenCapturer {
 
 impl ScreenCapturer {
     pub fn enumerate_monitors() -> Vec<MonitorDescriptor> {
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         {
             let mut list = Vec::new();
             if let Ok(monitors) = std::panic::catch_unwind(|| Monitor::enumerate()) {
@@ -685,7 +687,7 @@ impl ScreenCapturer {
         {
             macos_capture::enumerate_monitors_macos()
         }
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             vec![MonitorDescriptor {
                 index: 1,
@@ -704,7 +706,7 @@ impl ScreenCapturer {
     }
 
     pub fn new_with_monitor_index(index: usize) -> Result<Self, CaptureError> {
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         {
             let monitors = Self::enumerate_monitors();
             let mon_desc = monitors
@@ -816,7 +818,7 @@ impl ScreenCapturer {
                 height,
             })
         }
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let shared = CaptureShared {
                 latest_frame: Arc::new(RwLock::new(None)),
@@ -832,7 +834,7 @@ impl ScreenCapturer {
     }
 
     pub fn switch_monitor(&self, index: usize) -> Result<(), CaptureError> {
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         {
             let monitors = Self::enumerate_monitors();
             let mon_desc = monitors
@@ -907,7 +909,7 @@ impl ScreenCapturer {
             self.active_monitor_index.store(index, Ordering::SeqCst);
             Ok(())
         }
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             self.active_monitor_index.store(index, Ordering::SeqCst);
             Ok(())
@@ -929,7 +931,7 @@ impl ScreenCapturer {
 
 impl Drop for ScreenCapturer {
     fn drop(&mut self) {
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         {
             if let Some(backend) = self.control.lock().take() {
                 backend.stop();

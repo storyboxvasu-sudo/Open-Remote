@@ -17,7 +17,7 @@ pub struct InputInjector {
 
 impl InputInjector {
     pub fn new() -> Self {
-        #[cfg(windows)]
+        #[cfg(target_os = "windows")]
         {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
                 GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
@@ -42,7 +42,7 @@ impl InputInjector {
                 active_monitor: RwLock::new((bounds.origin.x as i32, bounds.origin.y as i32, w, h)),
             }
         }
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             Self {
                 active_monitor: RwLock::new((0, 0, 1920, 1080)),
@@ -56,7 +56,7 @@ impl InputInjector {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     pub fn inject(&self, event: &InputEvent) -> Result<(), InputError> {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
         use windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos;
@@ -296,7 +296,7 @@ impl InputInjector {
         Ok(())
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     pub fn inject(&self, _event: &InputEvent) -> Result<(), InputError> {
         Err(InputError::UnsupportedPlatform)
     }
@@ -362,6 +362,8 @@ pub mod macos_input {
     pub const kCGMouseButtonCenter: CGMouseButton = 2;
 
     #[link(name = "CoreGraphics", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         pub fn CGMainDisplayID() -> CGDirectDisplayID;
         pub fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
@@ -387,10 +389,6 @@ pub mod macos_input {
 
         pub fn CGEventPost(tap: CGEventTapLocation, event: CGEventRef);
         pub fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> CGError;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
         pub fn CFRelease(cf: CFTypeRef);
     }
 

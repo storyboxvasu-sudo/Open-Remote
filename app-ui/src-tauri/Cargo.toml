@@ -29,15 +29,8 @@ core-codec = { path = "../../crates/core-codec" }
 core-input = { path = "../../crates/core-input" }
 core-net = { path = "../../crates/core-net" }
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
 ] }
-
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = 3
-panic = "abort"
-strip = true
