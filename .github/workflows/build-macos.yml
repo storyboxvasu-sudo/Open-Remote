@@ -16,18 +16,22 @@ jobs:
     name: Build macOS ${{ matrix.name }}
     runs-on: macos-14
     env:
-      CC: clang
-      CXX: clang++
-      AR: ar
+      CC: /usr/bin/clang
+      CXX: /usr/bin/clang++
+      AR: /usr/bin/ar
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Intel-x64
             target: x86_64-apple-darwin
+            arch: x86_64
+            cflags: "-arch x86_64"
             dmg_name: OpenRemote-Intel-x64.dmg
           - name: AppleSilicon-arm64
             target: aarch64-apple-darwin
+            arch: arm64
+            cflags: "-arch arm64"
             dmg_name: OpenRemote-AppleSilicon-arm64.dmg
 
     steps:
@@ -46,8 +50,9 @@ jobs:
       - name: Verify macOS Toolchain
         run: |
           echo "=== Xcode Clang Version ==="
-          clang --version
+          /usr/bin/clang --version
           which clang
+          which /usr/bin/clang
           echo "=== Installed Rust Targets ==="
           rustup target list --installed
 
@@ -69,13 +74,38 @@ jobs:
         working-directory: app-ui
         run: pnpm build
 
+      - name: Configure macOS Native Clang Environment
+        run: |
+          echo "=== Configuring Native Clang Toolchain for ${{ matrix.name }} ==="
+          # Sanitize environment: Ensure no foreign / Windows / MSVC flags exist
+          unset CC_FORCE_DISABLE TARGET_CC TARGET_CFLAGS TARGET_AR
+          echo "Using Clang at: $(which /usr/bin/clang)"
+          /usr/bin/clang --version
+          echo "Target architecture: ${{ matrix.arch }}"
+          echo "CFLAGS: ${{ matrix.cflags }}"
+
       - name: Build Tauri macOS DMG
         working-directory: app-ui
         env:
           RUST_BACKTRACE: 1
-          CC: clang
-          CXX: clang++
-          AR: ar
+          # Enforce system Xcode Clang and architecture
+          CC: /usr/bin/clang
+          CXX: /usr/bin/clang++
+          AR: /usr/bin/ar
+          CFLAGS: ${{ matrix.cflags }}
+          CXXFLAGS: ${{ matrix.cflags }}
+          # Target-specific environment variables consumed by cc-rs (used by objc2-exception-helper)
+          CC_x86_64_apple_darwin: /usr/bin/clang
+          CXX_x86_64_apple_darwin: /usr/bin/clang++
+          CFLAGS_x86_64_apple_darwin: "-arch x86_64"
+          AR_x86_64_apple_darwin: /usr/bin/ar
+          CC_aarch64_apple_darwin: /usr/bin/clang
+          CXX_aarch64_apple_darwin: /usr/bin/clang++
+          CFLAGS_aarch64_apple_darwin: "-arch arm64"
+          AR_aarch64_apple_darwin: /usr/bin/ar
+          # Ensure Windows/MSVC include/lib variables are empty
+          INCLUDE: ""
+          LIB: ""
         run: |
           pnpm tauri build --target ${{ matrix.target }} --verbose
 
