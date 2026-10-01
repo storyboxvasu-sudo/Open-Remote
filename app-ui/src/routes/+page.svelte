@@ -43,6 +43,8 @@
     target_ip: string;
     message: string;
     initial_access_level?: AccessLevel;
+    requires_password?: boolean;
+    challenge?: string;
   }
 
   interface MonitorDescriptor {
@@ -126,6 +128,33 @@
   let clientAccessLevel = $state<AccessLevel>("Standard");
   let unlistenIncoming: UnlistenFn | null = null;
   let unlistenSession: UnlistenFn | null = null;
+
+  // Unattended Access State
+  interface UnattendedAccessSummary {
+    enabled: boolean;
+    has_password: boolean;
+    profile: AccessLevel;
+  }
+
+  let unattendedConfig = $state<UnattendedAccessSummary>({
+    enabled: false,
+    has_password: false,
+    profile: "Standard",
+  });
+  let showSetPasswordModal = $state(false);
+  let passwordInput = $state("");
+  let confirmPasswordInput = $state("");
+  let showPasswordText = $state(false);
+  let showConfirmPasswordText = $state(false);
+  let selectedProfileModal = $state<AccessLevel>("Standard");
+  let setPasswordError = $state("");
+  let isSavingPassword = $state(false);
+
+  // Client-side Remote Device Password Challenge Modal
+  let showClientPasswordModal = $state(false);
+  let clientPasswordInput = $state("");
+  let showClientPasswordText = $state(false);
+  let clientPasswordError = $state("");
 
   // Auto-Updater State
   let availableUpdate = $state<Update | null>(null);
@@ -267,6 +296,102 @@
     }
   }
 
+  async function loadUnattendedConfig() {
+    try {
+      const cfg: UnattendedAccessSummary = await invoke("get_unattended_access_config");
+      unattendedConfig = cfg;
+      selectedProfileModal = cfg.profile;
+    } catch (err) {
+      console.error("Failed to load unattended access config:", err);
+    }
+  }
+
+  async function handleToggleUnattended(enable: boolean) {
+    if (enable && !unattendedConfig.has_password) {
+      openSetPasswordModal();
+      return;
+    }
+    try {
+      const updated: UnattendedAccessSummary = await invoke("toggle_unattended_access", { enabled: enable });
+      unattendedConfig = updated;
+    } catch (err: any) {
+      console.error("Failed to toggle unattended access:", err);
+    }
+  }
+
+  async function handleProfileChange(newProfile: AccessLevel) {
+    try {
+      await invoke("update_unattended_access_profile", { profile: newProfile });
+      unattendedConfig.profile = newProfile;
+    } catch (err) {
+      console.error("Failed to update unattended profile:", err);
+    }
+  }
+
+  function openSetPasswordModal() {
+    passwordInput = "";
+    confirmPasswordInput = "";
+    setPasswordError = "";
+    showPasswordText = false;
+    showConfirmPasswordText = false;
+    selectedProfileModal = unattendedConfig.profile || "Standard";
+    showSetPasswordModal = true;
+  }
+
+  function closeSetPasswordModal() {
+    showSetPasswordModal = false;
+    passwordInput = "";
+    confirmPasswordInput = "";
+    setPasswordError = "";
+  }
+
+  async function saveUnattendedPassword() {
+    if (!passwordInput.trim()) {
+      setPasswordError = "Password cannot be empty";
+      return;
+    }
+    if (passwordInput.length < 4) {
+      setPasswordError = "Password must be at least 4 characters";
+      return;
+    }
+    if (passwordInput !== confirmPasswordInput) {
+      setPasswordError = "Passwords do not match";
+      return;
+    }
+    isSavingPassword = true;
+    setPasswordError = "";
+    try {
+      const updated: UnattendedAccessSummary = await invoke("set_unattended_access_password", {
+        password: passwordInput,
+        profile: selectedProfileModal,
+      });
+      unattendedConfig = updated;
+      closeSetPasswordModal();
+    } catch (err: any) {
+      setPasswordError = typeof err === "string" ? err : JSON.stringify(err);
+    } finally {
+      isSavingPassword = false;
+    }
+  }
+
+  async function removeUnattendedPassword() {
+    try {
+      const updated: UnattendedAccessSummary = await invoke("remove_unattended_access_password");
+      unattendedConfig = updated;
+    } catch (err) {
+      console.error("Failed to remove unattended password:", err);
+    }
+  }
+
+  async function disconnectHostPartner() {
+    try {
+      await invoke("disconnect_host_session");
+      await loadHostSessionState();
+    } catch (err) {
+      console.error("Failed to disconnect host partner:", err);
+    }
+  }
+
   async function loadSystemInfo() {
     try {
       const info: SystemInfo = await invoke("get_system_info");
@@ -373,18 +498,31 @@
     }
   }
 
-  async function connectToRemote() {
+  async function connectToRemote(passwordToUse?: string) {
     if (!targetAddress.trim() || isConnecting) return;
     isConnecting = true;
     connectionError = "";
+    clientPasswordError = "";
 
     try {
       const res: ClientConnectResult = await invoke("connect_to_remote", {
         targetAddress: targetAddress.trim(),
         port: 44321,
+        password: passwordToUse || null,
       });
 
+      if (res.requires_password) {
+        isConnecting = false;
+        showClientPasswordModal = true;
+        clientPasswordInput = "";
+        clientPasswordError = "";
+        return;
+      }
+
       if (res.success) {
+        showClientPasswordModal = false;
+        clientPasswordInput = "";
+        clientPasswordError = "";
         isConnected = true;
         isConnecting = false;
         if (res.initial_access_level) {
@@ -394,7 +532,12 @@
         initStreamWebSocket(res.local_ws_port);
       }
     } catch (err: any) {
-      connectionError = typeof err === "string" ? err : JSON.stringify(err);
+      const errMsg = typeof err === "string" ? err : JSON.stringify(err);
+      if (showClientPasswordModal) {
+        clientPasswordError = errMsg.includes("Incorrect") ? "Incorrect Password. Please try again." : errMsg;
+      } else {
+        connectionError = errMsg;
+      }
       isConnecting = false;
       isConnected = false;
     }
@@ -946,6 +1089,7 @@
     loadMonitors();
     loadRecentSessions();
     loadHostSessionState();
+    loadUnattendedConfig();
     checkForUpdates(true);
 
     animFrameId = requestAnimationFrame(renderLoop);
@@ -1281,7 +1425,7 @@
                   <button
                     class="btn-connect-primary"
                     disabled={isConnecting || !targetAddress.trim()}
-                    onclick={connectToRemote}
+                    onclick={() => connectToRemote()}
                   >
                     {#if isConnecting}
                       <span class="btn-spinner"></span>
@@ -1372,6 +1516,91 @@
         {:else if activeDashboardTab === "permissions"}
           <!-- Dedicated Permissions Tab View -->
           <div class="permissions-tab-container">
+            <!-- Unattended Access Section (AnyDesk Style) -->
+            <div class="perm-section-card unattended-card">
+              <div class="unattended-header-row">
+                <div class="card-caption">
+                  <span class="section-label">UNATTENDED ACCESS</span>
+                  <h2 class="card-heading">Password & Security Profile</h2>
+                  <p class="section-desc">
+                    Allows accessing this computer remotely by entering a password without requiring manual confirmation at this desk.
+                  </p>
+                </div>
+                <div class="unattended-toggle-wrap">
+                  <label class="switch-toggle" title="Enable / Disable Unattended Access">
+                    <input
+                      type="checkbox"
+                      checked={unattendedConfig.enabled}
+                      onchange={(e) => handleToggleUnattended(e.currentTarget.checked)}
+                    />
+                    <span class="switch-slider"></span>
+                  </label>
+                  <span class="toggle-status-text" class:status-enabled={unattendedConfig.enabled}>
+                    {unattendedConfig.enabled ? "Enabled" : "Disabled"}
+                  </span>
+                </div>
+              </div>
+
+              <div class="unattended-body-grid">
+                <!-- Permission Profile Selector -->
+                <div class="unattended-box">
+                  <label class="box-label" for="unattended-profile-dropdown">Permission Profile</label>
+                  <div class="dropdown-wrapper">
+                    <select
+                      id="unattended-profile-dropdown"
+                      class="profile-select-control"
+                      value={unattendedConfig.profile}
+                      onchange={(e) => handleProfileChange(e.currentTarget.value as AccessLevel)}
+                    >
+                      <option value="ViewOnly">Screen Sharing (View Only)</option>
+                      <option value="Standard">Default (Standard Access)</option>
+                      <option value="FullAccess">Full Access</option>
+                    </select>
+                  </div>
+                  <p class="box-hint">
+                    {#if unattendedConfig.profile === "ViewOnly"}
+                      🔒 Screen Sharing (View Only): Remote clicks and typing will be blocked.
+                    {:else if unattendedConfig.profile === "Standard"}
+                      ⚡ Default (Standard Access): Remote user has standard mouse and keyboard input.
+                    {:else}
+                      🛡 Full Access: Remote user has complete interactive input and display switching.
+                    {/if}
+                  </p>
+                </div>
+
+                <!-- Password Credentials Box -->
+                <div class="unattended-box">
+                  <span class="box-label">Access Credentials</span>
+                  <div class="pwd-status-indicator">
+                    {#if unattendedConfig.has_password}
+                      <span class="pwd-indicator-dot green">●</span>
+                      <span class="pwd-indicator-label">Password is set & active</span>
+                    {:else}
+                      <span class="pwd-indicator-dot gray">○</span>
+                      <span class="pwd-indicator-label">No password set</span>
+                    {/if}
+                  </div>
+                  <div class="pwd-action-buttons">
+                    <button class="btn-set-password" onclick={openSetPasswordModal}>
+                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                      </svg>
+                      <span>{unattendedConfig.has_password ? "Change Password" : "Set Password"}</span>
+                    </button>
+                    {#if unattendedConfig.has_password}
+                      <button class="btn-remove-password" onclick={removeUnattendedPassword} title="Remove password and disable unattended access">
+                        Remove
+                      </button>
+                    {/if}
+                  </div>
+                  <p class="box-hint crypto-hint">
+                    🔐 Protected using SHA-256 with 128-bit cryptographic salt.
+                  </p>
+                </div>
+              </div>
+            </div>
+
             <!-- Active Connection Security Status Card -->
             <div class="perm-section-card">
               <div class="card-caption">
@@ -1387,6 +1616,9 @@
                       <span class="session-title">Remote Partner Connected</span>
                       <span class="session-sub">Peer ID: <strong>{hostSession.client_peer_id || "Direct Client"}</strong> • IP: {hostSession.client_ip || "Direct LAN"}</span>
                     </div>
+                    <button class="btn-disconnect-host-partner" onclick={disconnectHostPartner} title="Disconnect remote partner">
+                      Disconnect
+                    </button>
                   </div>
 
                   <p class="section-desc">
@@ -1757,6 +1989,209 @@
             </button>
             <button class="btn-accept" onclick={acceptIncomingConnection}>
               Accept & Start Sharing
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Set Password for Unattended Access Modal Dialog -->
+    {#if showSetPasswordModal}
+      <div class="modal-backdrop">
+        <div class="modal-card password-modal-card">
+          <div class="modal-header">
+            <div class="modal-badge-icon auth-badge-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+              </svg>
+            </div>
+            <div>
+              <h3 class="modal-title">Set Password for Unattended Access</h3>
+              <p class="modal-subtitle">Choose a secure password to access this computer from other devices</p>
+            </div>
+          </div>
+
+          <div class="modal-form-body">
+            <!-- New Password -->
+            <div class="input-field-group">
+              <label for="new-unattended-pwd">New Password</label>
+              <div class="password-input-wrap">
+                <input
+                  id="new-unattended-pwd"
+                  type={showPasswordText ? "text" : "password"}
+                  placeholder="Enter a strong password"
+                  bind:value={passwordInput}
+                  class="modal-input"
+                />
+                <button
+                  type="button"
+                  class="btn-eye"
+                  onclick={() => (showPasswordText = !showPasswordText)}
+                  title={showPasswordText ? "Hide password" : "Show password"}
+                >
+                  {#if showPasswordText}
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
+                      <line x1="1" y1="1" x2="23" y2="23"></line>
+                    </svg>
+                  {:else}
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                      <circle cx="12" cy="12" r="3"></circle>
+                    </svg>
+                  {/if}
+                </button>
+              </div>
+            </div>
+
+            <!-- Confirm Password -->
+            <div class="input-field-group">
+              <label for="confirm-unattended-pwd">Confirm Password</label>
+              <div class="password-input-wrap">
+                <input
+                  id="confirm-unattended-pwd"
+                  type={showConfirmPasswordText ? "text" : "password"}
+                  placeholder="Repeat your password"
+                  bind:value={confirmPasswordInput}
+                  class="modal-input"
+                />
+                <button
+                  type="button"
+                  class="btn-eye"
+                  onclick={() => (showConfirmPasswordText = !showConfirmPasswordText)}
+                  title={showConfirmPasswordText ? "Hide password" : "Show password"}
+                >
+                  {#if showConfirmPasswordText}
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
+                      <line x1="1" y1="1" x2="23" y2="23"></line>
+                    </svg>
+                  {:else}
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                      <circle cx="12" cy="12" r="3"></circle>
+                    </svg>
+                  {/if}
+                </button>
+              </div>
+            </div>
+
+            <!-- Permission Profile -->
+            <div class="input-field-group">
+              <label for="modal-profile-select">Default Permission Profile</label>
+              <select id="modal-profile-select" class="modal-select" bind:value={selectedProfileModal}>
+                <option value="ViewOnly">Screen Sharing (View Only)</option>
+                <option value="Standard">Default (Standard Access)</option>
+                <option value="FullAccess">Full Access</option>
+              </select>
+            </div>
+
+            {#if setPasswordError}
+              <div class="modal-error-alert">
+                <span>⚠</span> {setPasswordError}
+              </div>
+            {/if}
+          </div>
+
+          <div class="modal-actions">
+            <button type="button" class="btn-decline" onclick={closeSetPasswordModal}>
+              Cancel
+            </button>
+            <button type="button" class="btn-accept" disabled={isSavingPassword} onclick={saveUnattendedPassword}>
+              {#if isSavingPassword}
+                <span class="btn-spinner"></span>
+                <span>Saving...</span>
+              {:else}
+                Save Password
+              {/if}
+            </button>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Client Password Challenge Modal Dialog (When connecting to an Unattended Remote Host) -->
+    {#if showClientPasswordModal}
+      <div class="modal-backdrop">
+        <div class="modal-card password-modal-card">
+          <div class="modal-header">
+            <div class="modal-badge-icon auth-badge-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+              </svg>
+            </div>
+            <div>
+              <h3 class="modal-title">Enter Password for Remote Device</h3>
+              <p class="modal-subtitle">Remote Host <strong>{targetAddress}</strong> requires authentication</p>
+            </div>
+          </div>
+
+          <div class="modal-form-body">
+            <div class="input-field-group">
+              <label for="client-remote-pwd">Password</label>
+              <div class="password-input-wrap">
+                <input
+                  id="client-remote-pwd"
+                  type={showClientPasswordText ? "text" : "password"}
+                  placeholder="Enter remote unattended password"
+                  bind:value={clientPasswordInput}
+                  class="modal-input"
+                  onkeydown={(e) => { if (e.key === "Enter") connectToRemote(clientPasswordInput); }}
+                />
+                <button
+                  type="button"
+                  class="btn-eye"
+                  onclick={() => (showClientPasswordText = !showClientPasswordText)}
+                  title={showClientPasswordText ? "Hide password" : "Show password"}
+                >
+                  {#if showClientPasswordText}
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
+                      <line x1="1" y1="1" x2="23" y2="23"></line>
+                    </svg>
+                  {:else}
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                      <circle cx="12" cy="12" r="3"></circle>
+                    </svg>
+                  {/if}
+                </button>
+              </div>
+            </div>
+
+            {#if clientPasswordError}
+              <div class="modal-error-alert">
+                <span>⚠</span> {clientPasswordError}
+              </div>
+            {/if}
+          </div>
+
+          <div class="modal-actions">
+            <button
+              type="button"
+              class="btn-decline"
+              onclick={() => {
+                showClientPasswordModal = false;
+                clientPasswordInput = "";
+                clientPasswordError = "";
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="btn-accept"
+              disabled={isConnecting}
+              onclick={() => connectToRemote(clientPasswordInput)}
+            >
+              {#if isConnecting}
+                <span class="btn-spinner"></span>
+                <span>Connecting...</span>
+              {:else}
+                Connect
+              {/if}
             </button>
           </div>
         </div>
@@ -3124,5 +3559,327 @@
     justify-content: space-between;
     font-size: 0.75rem;
     color: #94a3b8;
+  }
+
+  /* Unattended Access Styles (AnyDesk style) */
+  .unattended-card {
+    background: rgba(15, 23, 42, 0.65);
+    border: 1px solid rgba(56, 189, 248, 0.18);
+  }
+
+  .unattended-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 18px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  .unattended-toggle-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+
+  /* Switch Toggle */
+  .switch-toggle {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 24px;
+    cursor: pointer;
+  }
+
+  .switch-toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .switch-slider {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(255, 255, 255, 0.15);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 24px;
+    transition: all 0.2s ease;
+  }
+
+  .switch-slider:before {
+    position: absolute;
+    content: "";
+    height: 18px;
+    width: 18px;
+    left: 2px;
+    bottom: 2px;
+    background-color: #cbd5e1;
+    border-radius: 50%;
+    transition: all 0.2s ease;
+  }
+
+  .switch-toggle input:checked + .switch-slider {
+    background-color: #0284c7;
+    border-color: #38bdf8;
+  }
+
+  .switch-toggle input:checked + .switch-slider:before {
+    transform: translateX(20px);
+    background-color: #ffffff;
+  }
+
+  .toggle-status-text {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #64748b;
+  }
+
+  .toggle-status-text.status-enabled {
+    color: #38bdf8;
+  }
+
+  .unattended-body-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  @media (max-width: 700px) {
+    .unattended-body-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .unattended-box {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .box-label {
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #94a3b8;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+
+  .dropdown-wrapper {
+    position: relative;
+    width: 100%;
+  }
+
+  .profile-select-control {
+    width: 100%;
+    background: rgba(15, 23, 42, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    color: #f1f5f9;
+    padding: 9px 12px;
+    font-size: 0.84rem;
+    outline: none;
+    cursor: pointer;
+    transition: border-color 0.15s ease;
+  }
+
+  .profile-select-control:focus {
+    border-color: #38bdf8;
+  }
+
+  .box-hint {
+    margin: 0;
+    font-size: 0.76rem;
+    color: #94a3b8;
+    line-height: 1.4;
+  }
+
+  .crypto-hint {
+    color: #64748b;
+    font-size: 0.72rem;
+  }
+
+  .pwd-status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+
+  .pwd-indicator-dot.green {
+    color: #22c55e;
+  }
+
+  .pwd-indicator-dot.gray {
+    color: #64748b;
+  }
+
+  .pwd-indicator-label {
+    color: #e2e8f0;
+  }
+
+  .pwd-action-buttons {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .btn-set-password {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    background: #0284c7;
+    border: none;
+    color: #ffffff;
+    font-size: 0.8rem;
+    font-weight: 600;
+    padding: 7px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+
+  .btn-set-password:hover {
+    background: #0369a1;
+  }
+
+  .btn-remove-password {
+    background: transparent;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #f87171;
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .btn-remove-password:hover {
+    background: rgba(239, 68, 68, 0.15);
+    border-color: #ef4444;
+  }
+
+  /* Host Partner Disconnect button */
+  .btn-disconnect-host-partner {
+    margin-left: auto;
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #fca5a5;
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .btn-disconnect-host-partner:hover {
+    background: rgba(239, 68, 68, 0.3);
+    color: #ffffff;
+  }
+
+  /* Password Modals */
+  .password-modal-card {
+    max-width: 440px;
+  }
+
+  .auth-badge-icon {
+    background: rgba(56, 189, 248, 0.15);
+    color: #38bdf8;
+  }
+
+  .modal-form-body {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    margin: 16px 0;
+  }
+
+  .input-field-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .input-field-group label {
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: #94a3b8;
+  }
+
+  .password-input-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .modal-input {
+    width: 100%;
+    background: rgba(15, 23, 42, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    color: #ffffff;
+    font-size: 0.88rem;
+    padding: 10px 38px 10px 12px;
+    outline: none;
+    box-sizing: border-box;
+    transition: border-color 0.15s ease;
+  }
+
+  .modal-input:focus {
+    border-color: #38bdf8;
+  }
+
+  .modal-select {
+    width: 100%;
+    background: rgba(15, 23, 42, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    color: #ffffff;
+    font-size: 0.85rem;
+    padding: 9px 12px;
+    outline: none;
+    box-sizing: border-box;
+    cursor: pointer;
+  }
+
+  .btn-eye {
+    position: absolute;
+    right: 8px;
+    background: transparent;
+    border: none;
+    color: #64748b;
+    padding: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.15s ease;
+  }
+
+  .btn-eye:hover {
+    color: #e2e8f0;
+  }
+
+  .modal-error-alert {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    color: #fca5a5;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
 </style>

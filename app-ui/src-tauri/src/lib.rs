@@ -12,7 +12,7 @@ use tauri::{Emitter, Manager, State};
 
 use app_common::{
     AccessLevel, HostSessionInfo, IncomingRequestInfo, InputEvent,
-    MonitorDescriptor, PeerConfig, PeerId, RecentSession,
+    MonitorDescriptor, PeerConfig, PeerId, RecentSession, UnattendedAccessConfig,
 };
 use core_capture::ScreenCapturer;
 use core_codec::FrameEncoder;
@@ -37,6 +37,13 @@ pub struct HostStatus {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnattendedAccessSummary {
+    pub enabled: bool,
+    pub has_password: bool,
+    pub profile: AccessLevel,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientConnectResult {
     pub success: bool,
@@ -44,6 +51,10 @@ pub struct ClientConnectResult {
     pub target_ip: String,
     pub message: String,
     pub initial_access_level: AccessLevel,
+    #[serde(default)]
+    pub requires_password: bool,
+    #[serde(default)]
+    pub challenge: Option<String>,
 }
 
 pub struct ActiveHost {
@@ -149,6 +160,8 @@ async fn internal_start_hosting(
     let capturer = Arc::clone(&state.capturer);
     let host_net = Arc::new(DirectLanHost::with_peer_id(port, state.peer_id.clone(), Arc::clone(&capturer)));
     host_net.set_default_access_level(*state.default_access_level.read());
+    let cfg = PeerConfig::load();
+    host_net.set_unattended_access(cfg.unattended_access);
 
     // Hook prompt callback for incoming connection requests
     let app_handle_opt = Arc::clone(&state.app_handle);
@@ -269,6 +282,7 @@ async fn connect_to_remote(
     target_address: Option<String>,
     target_ip: Option<String>,
     port: Option<u16>,
+    password: Option<String>,
     state: State<'_, AppEngineState>,
 ) -> Result<ClientConnectResult, String> {
     let mut client_guard = state.client.lock().await;
@@ -293,11 +307,31 @@ async fn connect_to_remote(
         .map_err(|e| format!("Failed to initialize connection to {}: {:?}", target_addr, e))?;
     let client_arc = Arc::new(client);
 
-    // Perform handshake and connect video stream
-    let (mut video_stream, initial_access_level) = client_arc
-        .connect_video_stream()
-        .await
-        .map_err(|e| format!("{}", e))?;
+    // Perform handshake and connect video stream (with password if provided)
+    let connect_res = client_arc
+        .connect_video_stream_with_password(password)
+        .await;
+
+    let (mut video_stream, initial_access_level) = match connect_res {
+        Ok(res) => res,
+        Err(core_net::NetError::AuthRequired(challenge)) => {
+            return Ok(ClientConnectResult {
+                success: false,
+                local_ws_port: 0,
+                target_ip: target_addr.to_string(),
+                message: "Authentication required".to_string(),
+                initial_access_level: AccessLevel::Standard,
+                requires_password: true,
+                challenge: Some(challenge.challenge),
+            });
+        }
+        Err(core_net::NetError::IncorrectPassword(reason)) => {
+            return Err(reason);
+        }
+        Err(e) => {
+            return Err(format!("{}", e));
+        }
+    };
 
     // Save successfully connected Peer ID or IP in recent history
     let mut config = PeerConfig::load();
@@ -405,6 +439,8 @@ async fn connect_to_remote(
         target_ip: target_addr.to_string(),
         message: format!("Connected to {}", target_addr),
         initial_access_level,
+        requires_password: false,
+        challenge: None,
     })
 }
 
@@ -562,6 +598,127 @@ fn save_recent_session(peer_id: String, alias: Option<String>) -> Result<(), Str
     let mut config = PeerConfig::load();
     config.add_recent(&peer_id, alias);
     Ok(())
+}
+
+#[tauri::command]
+fn get_unattended_access_config() -> Result<UnattendedAccessSummary, String> {
+    let config = PeerConfig::load();
+    Ok(UnattendedAccessSummary {
+        enabled: config.unattended_access.enabled,
+        has_password: config.unattended_access.password_hash.is_some(),
+        profile: config.unattended_access.profile,
+    })
+}
+
+#[tauri::command]
+async fn set_unattended_access_password(
+    password: String,
+    profile: AccessLevel,
+    state: State<'_, AppEngineState>,
+) -> Result<UnattendedAccessSummary, String> {
+    if password.trim().is_empty() {
+        return Err("Password cannot be empty".to_string());
+    }
+    let mut config = PeerConfig::load();
+    let salt = app_common::generate_salt();
+    let hash = app_common::hash_password(&password, &salt);
+    config.unattended_access = UnattendedAccessConfig {
+        enabled: true,
+        password_hash: Some(hash),
+        salt: Some(salt),
+        profile,
+    };
+    config.save().map_err(|e| format!("Failed to save config: {}", e))?;
+
+    if let Ok(guard) = state.host.try_lock() {
+        if let Some(host) = guard.as_ref() {
+            host.host_net.set_unattended_access(config.unattended_access.clone());
+        }
+    }
+
+    Ok(UnattendedAccessSummary {
+        enabled: config.unattended_access.enabled,
+        has_password: true,
+        profile: config.unattended_access.profile,
+    })
+}
+
+#[tauri::command]
+async fn toggle_unattended_access(
+    enabled: bool,
+    state: State<'_, AppEngineState>,
+) -> Result<UnattendedAccessSummary, String> {
+    let mut config = PeerConfig::load();
+    if enabled && config.unattended_access.password_hash.is_none() {
+        return Err("Cannot enable Unattended Access without setting a password first".to_string());
+    }
+    config.unattended_access.enabled = enabled;
+    config.save().map_err(|e| format!("Failed to save config: {}", e))?;
+
+    if let Ok(guard) = state.host.try_lock() {
+        if let Some(host) = guard.as_ref() {
+            host.host_net.set_unattended_access(config.unattended_access.clone());
+        }
+    }
+
+    Ok(UnattendedAccessSummary {
+        enabled: config.unattended_access.enabled,
+        has_password: config.unattended_access.password_hash.is_some(),
+        profile: config.unattended_access.profile,
+    })
+}
+
+#[tauri::command]
+async fn update_unattended_access_profile(
+    profile: AccessLevel,
+    state: State<'_, AppEngineState>,
+) -> Result<(), String> {
+    let mut config = PeerConfig::load();
+    config.unattended_access.profile = profile;
+    config.save().map_err(|e| format!("Failed to save config: {}", e))?;
+
+    if let Ok(guard) = state.host.try_lock() {
+        if let Some(host) = guard.as_ref() {
+            host.host_net.set_unattended_access(config.unattended_access.clone());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_unattended_access_password(
+    state: State<'_, AppEngineState>,
+) -> Result<UnattendedAccessSummary, String> {
+    let mut config = PeerConfig::load();
+    config.unattended_access.enabled = false;
+    config.unattended_access.password_hash = None;
+    config.unattended_access.salt = None;
+    config.save().map_err(|e| format!("Failed to save config: {}", e))?;
+
+    if let Ok(guard) = state.host.try_lock() {
+        if let Some(host) = guard.as_ref() {
+            host.host_net.set_unattended_access(config.unattended_access.clone());
+        }
+    }
+
+    Ok(UnattendedAccessSummary {
+        enabled: false,
+        has_password: false,
+        profile: config.unattended_access.profile,
+    })
+}
+
+#[tauri::command]
+async fn disconnect_host_session(state: State<'_, AppEngineState>) -> Result<bool, String> {
+    let host_guard = state.host.lock().await;
+    if let Some(host) = host_guard.as_ref() {
+        let port = host.control_port;
+        host.stop();
+        drop(host_guard);
+        let _ = internal_start_hosting(&state, port).await;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[tauri::command]
@@ -807,6 +964,12 @@ pub fn run() {
             set_session_access_level,
             set_default_access_level,
             get_host_session_state,
+            get_unattended_access_config,
+            set_unattended_access_password,
+            toggle_unattended_access,
+            update_unattended_access_profile,
+            remove_unattended_access_password,
+            disconnect_host_session,
             app_minimize,
             app_toggle_maximize,
             app_close,

@@ -30,6 +30,49 @@ pub struct SessionHandshake {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnattendedAccessConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub password_hash: Option<String>,
+    #[serde(default)]
+    pub salt: Option<String>,
+    #[serde(default)]
+    pub profile: AccessLevel,
+}
+
+impl Default for UnattendedAccessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            password_hash: None,
+            salt: None,
+            profile: AccessLevel::Standard,
+        }
+    }
+}
+
+pub fn generate_salt() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let random_bytes: [u8; 16] = rng.gen();
+    hex::encode(random_bytes)
+}
+
+pub fn hash_password(password: &str, salt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(password.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+pub fn verify_password(password: &str, salt: &str, expected_hash: &str) -> bool {
+    let computed = hash_password(password, salt);
+    computed.eq_ignore_ascii_case(expected_hash)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
     pub peer_id: String,
     #[serde(default)]
@@ -38,6 +81,8 @@ pub struct PeerConfig {
     pub created_at: u64,
     #[serde(default)]
     pub recent_sessions: Vec<RecentSession>,
+    #[serde(default)]
+    pub unattended_access: UnattendedAccessConfig,
 }
 
 impl PeerConfig {
@@ -59,6 +104,7 @@ impl PeerConfig {
                 .unwrap_or_default()
                 .as_secs(),
             recent_sessions: Vec::new(),
+            unattended_access: UnattendedAccessConfig::default(),
         }
     }
 
@@ -205,6 +251,7 @@ impl PeerId {
                 .unwrap_or_default()
                 .as_secs(),
             recent_sessions: Vec::new(),
+            unattended_access: UnattendedAccessConfig::default(),
         };
 
         let dir = Self::config_dir();
@@ -279,10 +326,31 @@ impl Default for AccessLevel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthChallenge {
+    pub challenge: String,
+    pub salt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthResponse {
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthResult {
+    pub success: bool,
+    pub profile: Option<AccessLevel>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionHandshakeRequest {
     pub client_peer_id: String,
     #[serde(default)]
     pub client_name: Option<String>,
+    #[serde(default)]
+    pub auth_response: Option<AuthResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +359,10 @@ pub struct ConnectionHandshakeResponse {
     pub access_level: AccessLevel,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub auth_challenge: Option<AuthChallenge>,
+    #[serde(default)]
+    pub auth_result: Option<AuthResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
