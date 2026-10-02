@@ -3,6 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { check, type Update } from "@tauri-apps/plugin-updater";
+  import { getVersion } from "@tauri-apps/api/app";
 
   type AccessLevel = "ViewOnly" | "Standard" | "FullAccess";
 
@@ -158,6 +159,7 @@
   let clientPasswordError = $state("");
 
   // Auto-Updater State
+  let currentAppVersion = $state("1.0.6");
   let availableUpdate = $state<Update | null>(null);
   let isCheckingUpdate = $state(false);
   let isDownloadingUpdate = $state(false);
@@ -179,18 +181,31 @@
     updateStatusText = "Checking for updates...";
 
     try {
-      const update = await check();
+      // 10-second timeout guarantee so checking never hangs indefinitely
+      const timeoutPromise = new Promise<null>((_, reject) =>
+        setTimeout(() => reject(new Error("Update check request timed out")), 10000)
+      );
+
+      const update = await Promise.race([check(), timeoutPromise]);
       if (update) {
         availableUpdate = update;
         showUpdateModal = true;
         updateStatusText = `Update available: v${update.version}`;
       } else {
         availableUpdate = null;
-        updateStatusText = "OpenRemote is up to date (v1.0.0)";
+        updateStatusText = `OpenRemote is up to date (v${currentAppVersion})`;
       }
     } catch (err: any) {
       console.warn("Auto-updater check notice:", err);
-      updateStatusText = "OpenRemote is up to date (v1.0.0)";
+      availableUpdate = null;
+      const errMsg = typeof err === "string" ? err : (err?.message || JSON.stringify(err));
+      if (errMsg.includes("timed out")) {
+        updateStatusText = "Update check timed out. Please check your network connection.";
+      } else if (errMsg.includes("404") || errMsg.includes("not found") || errMsg.includes("release")) {
+        updateStatusText = `No new updates found (v${currentAppVersion} is latest)`;
+      } else {
+        updateStatusText = `OpenRemote v${currentAppVersion} is running`;
+      }
     } finally {
       isCheckingUpdate = false;
     }
@@ -1093,6 +1108,15 @@
   let fpsInterval: number | null = null;
 
   onMount(async () => {
+    try {
+      const ver = await getVersion();
+      if (ver) {
+        currentAppVersion = ver;
+      }
+    } catch (err) {
+      console.warn("Could not read dynamic app version from Tauri:", err);
+    }
+
     loadSystemInfo();
     loadMonitors();
     loadRecentSessions();
@@ -1776,12 +1800,12 @@
                 <div class="update-info-group">
                   <div class="update-version-row">
                     <span class="version-label">Current Version:</span>
-                    <span class="version-badge">v1.0.0</span>
+                    <span class="version-badge">v{currentAppVersion}</span>
                     {#if availableUpdate}
                       <span class="update-ready-pill">v{availableUpdate.version} Ready</span>
                     {/if}
                   </div>
-                  <p class="update-status-msg">{updateStatusText || "OpenRemote is up to date"}</p>
+                  <p class="update-status-msg">{updateStatusText || `OpenRemote is up to date (v${currentAppVersion})`}</p>
                 </div>
                 <button
                   class="btn-check-updates"
@@ -1857,7 +1881,7 @@
           <div class="update-details-box">
             <div class="detail-row">
               <span class="detail-key">Current Version:</span>
-              <span class="detail-val">{availableUpdate.currentVersion || "1.0.0"}</span>
+              <span class="detail-val">v{availableUpdate.currentVersion || currentAppVersion}</span>
             </div>
             <div class="detail-row">
               <span class="detail-key">Latest Version:</span>
