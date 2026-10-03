@@ -48,10 +48,10 @@ jobs:
         env:
           RUST_BACKTRACE: 1
           # Tauri Auto-Updater Signing Keys
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD || '' }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD || '' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY || secrets.TAURI_PRIVATE_KEY }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY || secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || secrets.TAURI_KEY_PASSWORD || '' }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || secrets.TAURI_KEY_PASSWORD || '' }}
         run: |
           pnpm tauri build --target x86_64-pc-windows-msvc --verbose
 
@@ -59,11 +59,16 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY || secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || secrets.TAURI_KEY_PASSWORD || '' }}
         run: |
           New-Item -ItemType Directory -Force -Path artifacts | Out-Null
 
           # 1. Collect NSIS Installer (.exe)
           $setupExe = Get-ChildItem -Path target -Recurse -Filter "*setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $setupExe) {
+            $setupExe = Get-ChildItem -Path . -Recurse -Filter "*setup.exe" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "*artifacts*" } | Select-Object -First 1
+          }
           if ($setupExe) {
             Copy-Item $setupExe.FullName "artifacts/OpenRemote-Windows-x64-Setup.exe"
             Write-Host "Collected Setup: artifacts/OpenRemote-Windows-x64-Setup.exe"
@@ -74,6 +79,9 @@ jobs:
 
           # 2. Collect MSI Installer (.msi)
           $msi = Get-ChildItem -Path target -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $msi) {
+            $msi = Get-ChildItem -Path . -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike "*artifacts*" } | Select-Object -First 1
+          }
           if ($msi) {
             Copy-Item $msi.FullName "artifacts/OpenRemote-Windows-x64.msi"
             Write-Host "Collected MSI: artifacts/OpenRemote-Windows-x64.msi"
@@ -82,48 +90,70 @@ jobs:
             exit 1
           }
 
-          # 3. Collect Windows Updater Bundle (.nsis.zip or .msi.zip)
+          # 3. Locate or Generate Windows Updater Bundle (.nsis.zip & .sig)
+          Write-Host "=== Inspecting Target for Updater Bundles ==="
+          Get-ChildItem -Path target -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.zip*" -or $_.Name -like "*.sig*" } | Select-Object FullName
+
           $nsisZip = Get-ChildItem -Path target -Recurse -Filter "*nsis.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
           $nsisSig = Get-ChildItem -Path target -Recurse -Filter "*nsis.zip.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
 
           $msiZip = Get-ChildItem -Path target -Recurse -Filter "*msi.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
           $msiSig = Get-ChildItem -Path target -Recurse -Filter "*msi.zip.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
 
-          # Fallback generic .zip
-          if (-not $nsisZip -and -not $msiZip) {
-            $nsisZip = Get-ChildItem -Path target -Recurse -Filter "*.zip" -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*updater*" -or $_.Name -like "*setup*" } | Select-Object -First 1
-            $nsisSig = Get-ChildItem -Path target -Recurse -Filter "*.zip.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
-          }
-
-          $updaterFile = $null
-          $updaterSig = $null
-
-          if ($nsisZip -and $nsisSig) {
+          if ($nsisZip) {
             Copy-Item $nsisZip.FullName "artifacts/OpenRemote-Windows-x64.nsis.zip"
-            Copy-Item $nsisSig.FullName "artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
             Write-Host "Collected NSIS Updater: artifacts/OpenRemote-Windows-x64.nsis.zip"
-            $updaterFile = "OpenRemote-Windows-x64.nsis.zip"
-            $updaterSig = "artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
+            if ($nsisSig) {
+              Copy-Item $nsisSig.FullName "artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
+              Write-Host "Collected NSIS Signature: artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
+            } elseif (Test-Path "$($nsisZip.FullName).sig") {
+              Copy-Item "$($nsisZip.FullName).sig" "artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
+              Write-Host "Collected NSIS Signature: artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
+            }
           }
 
-          if ($msiZip -and $msiSig) {
+          if ($msiZip) {
             Copy-Item $msiZip.FullName "artifacts/OpenRemote-Windows-x64.msi.zip"
-            Copy-Item $msiSig.FullName "artifacts/OpenRemote-Windows-x64.msi.zip.sig"
             Write-Host "Collected MSI Updater: artifacts/OpenRemote-Windows-x64.msi.zip"
-            if (-not $updaterFile) {
-              $updaterFile = "OpenRemote-Windows-x64.msi.zip"
-              $updaterSig = "artifacts/OpenRemote-Windows-x64.msi.zip.sig"
+            if ($msiSig) {
+              Copy-Item $msiSig.FullName "artifacts/OpenRemote-Windows-x64.msi.zip.sig"
+              Write-Host "Collected MSI Signature: artifacts/OpenRemote-Windows-x64.msi.zip.sig"
+            } elseif (Test-Path "$($msiZip.FullName).sig") {
+              Copy-Item "$($msiZip.FullName).sig" "artifacts/OpenRemote-Windows-x64.msi.zip.sig"
+              Write-Host "Collected MSI Signature: artifacts/OpenRemote-Windows-x64.msi.zip.sig"
+            }
+          }
+
+          # If .nsis.zip was not generated by bundler, package setup.exe into .nsis.zip
+          if (-not (Test-Path "artifacts/OpenRemote-Windows-x64.nsis.zip")) {
+            Write-Host "Creating artifacts/OpenRemote-Windows-x64.nsis.zip from setup installer..."
+            Compress-Archive -Path $setupExe.FullName -DestinationPath "artifacts/OpenRemote-Windows-x64.nsis.zip" -Force
+          }
+
+          # If signature file is missing, generate it via tauri signer sign
+          if (-not (Test-Path "artifacts/OpenRemote-Windows-x64.nsis.zip.sig")) {
+            if ($env:TAURI_SIGNING_PRIVATE_KEY) {
+              Write-Host "Signing artifacts/OpenRemote-Windows-x64.nsis.zip using tauri signer..."
+              pnpm --dir app-ui tauri signer sign "artifacts/OpenRemote-Windows-x64.nsis.zip"
+            } else {
+              Write-Warning "TAURI_SIGNING_PRIVATE_KEY not available to sign nsis.zip!"
             }
           }
 
           # 4. Generate / Update latest.json
-          if ($updaterFile -and $updaterSig) {
+          if (Test-Path "artifacts/OpenRemote-Windows-x64.nsis.zip.sig") {
             node scripts/update-latest-json.js `
               windows-x86_64 `
-              $updaterSig `
-              $updaterFile
+              artifacts/OpenRemote-Windows-x64.nsis.zip.sig `
+              OpenRemote-Windows-x64.nsis.zip
+          } elseif (Test-Path "artifacts/OpenRemote-Windows-x64.msi.zip.sig") {
+            node scripts/update-latest-json.js `
+              windows-x86_64 `
+              artifacts/OpenRemote-Windows-x64.msi.zip.sig `
+              OpenRemote-Windows-x64.msi.zip
           } else {
-            Write-Host "Notice: No Windows updater zip/sig found in target directory. Ensure TAURI_PRIVATE_KEY is configured."
+            Write-Error "No Windows updater signature found! Updater check will fail without a valid signature."
+            exit 1
           }
 
           Write-Host "=== Artifacts Directory Contents ==="

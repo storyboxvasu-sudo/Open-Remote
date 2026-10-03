@@ -125,13 +125,15 @@ async function run() {
     }
   }
 
-  // If local manifest has no platforms yet, try fetching existing remote manifest
-  if (!manifest.platforms || Object.keys(manifest.platforms).length === 0) {
-    const existing = await fetchExistingLatest();
-    if (existing && existing.platforms) {
-      console.log("Merged with existing remote latest.json platforms:", Object.keys(existing.platforms));
-      manifest = existing;
-    }
+  // Fetch existing remote manifest to merge cross-platform entries (e.g. Darwin + Windows)
+  const existing = await fetchExistingLatest();
+  if (existing && existing.platforms) {
+    console.log("Merged with existing remote latest.json platforms:", Object.keys(existing.platforms));
+    manifest.platforms = {
+      ...existing.platforms,
+      ...(manifest.platforms || {})
+    };
+    if (existing.notes && !manifest.notes) manifest.notes = existing.notes;
   }
 
   manifest.version = version;

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OpenRemote",
-  "version": "1.0.6",
+  "version": "1.0.8",
   "identifier": "com.openremote.desktop",
   "build": {
     "beforeBuildCommand": "pnpm build",
@@ -25,7 +25,7 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": "v1Compatible",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -74,7 +74,10 @@
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFGMzY2RThDNkM5OThBODkKUldTSmlwbHNqRzQycjJMY1NNYmNwMFNBakFOQThzSko3QmxabWk0MDFWUlNJZU1DbUpVNnRtZDEK",
       "endpoints": [
         "https://github.com/storyboxvasu-sudo/Open-Remote/releases/latest/download/latest.json"
-      ]
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }
