@@ -4,6 +4,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { check, type Update } from "@tauri-apps/plugin-updater";
   import { getVersion } from "@tauri-apps/api/app";
+  import { relaunch } from "@tauri-apps/plugin-process";
 
   type AccessLevel = "ViewOnly" | "Standard" | "FullAccess";
 
@@ -168,6 +169,7 @@
   let totalBytes = $state(0);
   let updateStatusText = $state("");
   let showUpdateModal = $state(false);
+  let updateCheckTimer: number | null = null;
 
   function formatBytes(bytes: number): string {
     if (!bytes || bytes <= 0) return "0 MB";
@@ -178,7 +180,9 @@
   async function checkForUpdates(silent: boolean = false) {
     if (isCheckingUpdate || isDownloadingUpdate) return;
     isCheckingUpdate = true;
-    updateStatusText = "Checking for updates...";
+    if (!silent) {
+      updateStatusText = "Checking for updates...";
+    }
 
     try {
       // 10-second timeout guarantee so checking never hangs indefinitely
@@ -193,18 +197,22 @@
         updateStatusText = `Update available: v${update.version}`;
       } else {
         availableUpdate = null;
-        updateStatusText = `OpenRemote is up to date (v${currentAppVersion})`;
+        if (!silent) {
+          updateStatusText = `OpenRemote is up to date (v${currentAppVersion})`;
+        }
       }
     } catch (err: any) {
       console.warn("Auto-updater check notice:", err);
       availableUpdate = null;
-      const errMsg = typeof err === "string" ? err : (err?.message || JSON.stringify(err));
-      if (errMsg.includes("timed out")) {
-        updateStatusText = "Update check timed out. Please check your network connection.";
-      } else if (errMsg.includes("404") || errMsg.includes("not found") || errMsg.includes("release")) {
-        updateStatusText = `No new updates found (v${currentAppVersion} is latest)`;
-      } else {
-        updateStatusText = `OpenRemote v${currentAppVersion} is running`;
+      if (!silent) {
+        const errMsg = typeof err === "string" ? err : (err?.message || JSON.stringify(err));
+        if (errMsg.includes("timed out")) {
+          updateStatusText = "Update check timed out. Please check your network connection.";
+        } else if (errMsg.includes("404") || errMsg.includes("not found") || errMsg.includes("release")) {
+          updateStatusText = `No new updates found (v${currentAppVersion} is latest)`;
+        } else {
+          updateStatusText = `OpenRemote v${currentAppVersion} is running`;
+        }
       }
     } finally {
       isCheckingUpdate = false;
@@ -232,8 +240,13 @@
         }
       });
 
-      // Restart application with newly installed binary
-      await invoke("app_relaunch");
+      // Seamless relaunch using @tauri-apps/plugin-process relaunch() with app_relaunch fallback
+      try {
+        await relaunch();
+      } catch (relaunchErr) {
+        console.warn("relaunch() fallback to app_relaunch:", relaunchErr);
+        await invoke("app_relaunch");
+      }
     } catch (err: any) {
       console.error("Failed to download or install update:", err);
       alert(`Update installation error: ${err?.message || err}`);
@@ -1122,7 +1135,11 @@
     loadRecentSessions();
     loadHostSessionState();
     loadUnattendedConfig();
-    checkForUpdates(true);
+
+    // Wait 4 seconds on startup to allow network/app initialization, then silently check for updates in background
+    updateCheckTimer = window.setTimeout(() => {
+      checkForUpdates(true);
+    }, 4000);
 
     animFrameId = requestAnimationFrame(renderLoop);
 
@@ -1149,6 +1166,7 @@
   });
 
   onDestroy(() => {
+    if (updateCheckTimer) clearTimeout(updateCheckTimer);
     if (animFrameId) cancelAnimationFrame(animFrameId);
     if (fpsInterval) clearInterval(fpsInterval);
     if (ws) ws.close();
@@ -1873,8 +1891,8 @@
               </svg>
             </div>
             <div>
-              <h3 class="modal-title">New Version Available!</h3>
-              <p class="modal-subtitle">OpenRemote v{availableUpdate.version} is ready to download and install.</p>
+              <h3 class="modal-title">Update Available</h3>
+              <p class="modal-subtitle">Version v{availableUpdate.version} is ready to install.</p>
             </div>
           </div>
 
@@ -1916,13 +1934,15 @@
 
           <div class="modal-actions">
             <button
+              type="button"
               class="btn-decline"
               disabled={isDownloadingUpdate}
               onclick={dismissUpdateModal}
             >
-              Remind Later
+              Later
             </button>
             <button
+              type="button"
               class="btn-accept"
               disabled={isDownloadingUpdate}
               onclick={startUpdateAndRestart}
@@ -1936,7 +1956,7 @@
                   <polyline points="7 10 12 15 17 10"></polyline>
                   <line x1="12" y1="15" x2="12" y2="3"></line>
                 </svg>
-                <span>Update & Restart</span>
+                <span>Update & Restart Now</span>
               {/if}
             </button>
           </div>
