@@ -1042,13 +1042,23 @@
   }
 
   function toggleFullscreen() {
-    if (!canvasContainerRef) return;
+    const targetElement = (document.querySelector(".window-shell") as HTMLElement) || canvasContainerRef;
     if (!document.fullscreenElement) {
-      canvasContainerRef.requestFullscreen().then(() => {
-        isFullscreen = true;
-      });
+      if (targetElement?.requestFullscreen) {
+        targetElement.requestFullscreen().then(() => {
+          isFullscreen = true;
+        }).catch(() => {
+          if (canvasContainerRef?.requestFullscreen) {
+            canvasContainerRef.requestFullscreen().then(() => {
+              isFullscreen = true;
+            });
+          }
+        });
+      }
     } else {
       document.exitFullscreen().then(() => {
+        isFullscreen = false;
+      }).catch(() => {
         isFullscreen = false;
       });
     }
@@ -1163,9 +1173,19 @@
     } catch (err) {
       console.error("Failed to attach event listeners:", err);
     }
+
+    const onFullscreenChange = () => {
+      isFullscreen = !!document.fullscreenElement;
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
   });
 
   onDestroy(() => {
+    if (typeof document !== "undefined") {
+      document.removeEventListener("fullscreenchange", () => {
+        isFullscreen = !!document.fullscreenElement;
+      });
+    }
     if (updateCheckTimer) clearTimeout(updateCheckTimer);
     if (animFrameId) cancelAnimationFrame(animFrameId);
     if (fpsInterval) clearInterval(fpsInterval);
@@ -1220,9 +1240,93 @@
 
     <div class="titlebar-center" data-tauri-drag-region>
       {#if isConnected}
-        <div class="session-status-chip" data-tauri-drag-region="false">
-          <span class="status-live-dot"></span>
-          <span>Live ({fps} FPS • {rttMs}ms)</span>
+        <!-- Dedicated Main Metrics Container -->
+        <div class="header-metrics-container" data-tauri-drag-region="false">
+          <!-- Device Name / Display Switcher -->
+          {#if remoteDisplays.length > 1}
+            <div class="monitor-switcher" data-tauri-drag-region="false">
+              <span class="switcher-title">Display:</span>
+              {#each remoteDisplays as disp}
+                <button
+                  class="btn-mon-pill"
+                  class:active={activeRemoteDisplayId === disp.id}
+                  onclick={() => switchRemoteDisplay(disp.id)}
+                  title={`${disp.name} (${disp.width}x${disp.height})`}
+                >
+                  🖥 Display {disp.id}
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <div class="monitor-badge" data-tauri-drag-region="false" title="Connected Remote Display">
+              <span class="badge-icon">🖥</span>
+              <span class="device-name">{remoteDisplays[0]?.name || "DELL E2421HN"}</span>
+            </div>
+          {/if}
+
+          <!-- Session Permission Badge -->
+          <div
+            class="hud-tag permission-badge"
+            class:badge-viewonly={clientAccessLevel === "ViewOnly"}
+            class:badge-standard={clientAccessLevel === "Standard"}
+            class:badge-full={clientAccessLevel === "FullAccess"}
+            title="Current Session Permission Level"
+            data-tauri-drag-region="false"
+          >
+            {#if clientAccessLevel === "ViewOnly"}
+              🔒 View Only
+            {:else if clientAccessLevel === "Standard"}
+              ⚡ Standard
+            {:else}
+              🛡 Full Access
+            {/if}
+          </div>
+
+          <!-- System Metrics: Resolution, FPS, MS -->
+          {#if remoteResolution.width > 0}
+            <div class="hud-tag res" data-tauri-drag-region="false" title="Resolution">
+              {remoteResolution.width}x{remoteResolution.height}
+            </div>
+          {/if}
+          <div class="hud-tag metric-fps" data-tauri-drag-region="false" title="Frames Per Second">
+            {fps} FPS
+          </div>
+          <div class="hud-tag metric-rtt" data-tauri-drag-region="false" title="Latency">
+            {rttMs} ms
+          </div>
+
+          <!-- Zoom Reset Button when pinched/zoomed -->
+          {#if zoomScale > 1.05}
+            <button class="hud-action zoom-reset-btn" data-tauri-drag-region="false" onclick={resetZoom} title="Reset Zoom">
+              🔍 {Math.round(zoomScale * 100)}%
+            </button>
+          {/if}
+
+          <!-- On-Screen Virtual Keyboard Toggle -->
+          <button
+            class="hud-action keyboard-btn"
+            data-tauri-drag-region="false"
+            onclick={toggleVirtualKeyboard}
+            title="Toggle Keyboard"
+          >
+            ⌨
+          </button>
+
+          <!-- Fullscreen Toggle Icon Button -->
+          <button
+            class="hud-action fullscreen-btn"
+            data-tauri-drag-region="false"
+            onclick={toggleFullscreen}
+            title={isFullscreen ? "Exit Fullscreen" : "Fullscreen"}
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              {#if isFullscreen}
+                <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"></path>
+              {:else}
+                <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path>
+              {/if}
+            </svg>
+          </button>
         </div>
       {/if}
     </div>
@@ -1292,70 +1396,74 @@
           oncontextmenu={(e) => e.preventDefault()}
         ></canvas>
 
-        <!-- Floating Quick HUD with Multi-Monitor Switcher & Mobile Tools -->
-        <div class="session-hud">
-          <!-- Multi-Monitor Switcher Buttons (Dynamic Remote Displays) -->
-          {#if remoteDisplays.length > 1}
-            <div class="monitor-switcher">
-              <span class="switcher-title">Display:</span>
-              {#each remoteDisplays as disp}
-                <button
-                  class="btn-mon-pill"
-                  class:active={activeRemoteDisplayId === disp.id}
-                  onclick={() => switchRemoteDisplay(disp.id)}
-                  title={`${disp.name} (${disp.width}x${disp.height})`}
-                >
-                  🖥 Display {disp.id}
-                </button>
-              {/each}
-            </div>
-          {:else if remoteDisplays.length === 1}
-            <div class="monitor-badge">
-              <span class="badge-icon">🖥</span> {remoteDisplays[0].name || `Display ${remoteDisplays[0].id}`}
-            </div>
-          {/if}
-
-          <!-- Zoom Reset Button when pinched/zoomed -->
-          {#if zoomScale > 1.05}
-            <button class="hud-action zoom-reset-btn" onclick={resetZoom} title="Reset Zoom">
-              🔍 {Math.round(zoomScale * 100)}%
-            </button>
-          {/if}
-
-          <!-- On-Screen Virtual Keyboard Toggle -->
-          <button class="hud-action keyboard-btn" onclick={toggleVirtualKeyboard} title="Toggle Keyboard">
-            ⌨
-          </button>
-
-          <!-- Session Permission Badge -->
-          <div
-            class="hud-tag permission-badge"
-            class:badge-viewonly={clientAccessLevel === "ViewOnly"}
-            class:badge-standard={clientAccessLevel === "Standard"}
-            class:badge-full={clientAccessLevel === "FullAccess"}
-            title="Current Session Permission Level"
-          >
-            {#if clientAccessLevel === "ViewOnly"}
-              🔒 View Only
-            {:else if clientAccessLevel === "Standard"}
-              ⚡ Standard
+        <!-- Floating Quick HUD (Only active during Fullscreen Mode, perfectly centered) -->
+        {#if isFullscreen}
+          <div class="session-hud">
+            <!-- Multi-Monitor Switcher Buttons (Dynamic Remote Displays) -->
+            {#if remoteDisplays.length > 1}
+              <div class="monitor-switcher">
+                <span class="switcher-title">Display:</span>
+                {#each remoteDisplays as disp}
+                  <button
+                    class="btn-mon-pill"
+                    class:active={activeRemoteDisplayId === disp.id}
+                    onclick={() => switchRemoteDisplay(disp.id)}
+                    title={`${disp.name} (${disp.width}x${disp.height})`}
+                  >
+                    🖥 Display {disp.id}
+                  </button>
+                {/each}
+              </div>
             {:else}
-              🛡 Full Access
+              <div class="monitor-badge">
+                <span class="badge-icon">🖥</span> {remoteDisplays[0]?.name || "DELL E2421HN"}
+              </div>
             {/if}
-          </div>
 
-          <div class="hud-tag res">{remoteResolution.width}x{remoteResolution.height}</div>
-          <div class="hud-tag">{fps} FPS</div>
-          <div class="hud-tag">{rttMs} ms</div>
-          <button class="hud-action" onclick={toggleFullscreen} title="Fullscreen">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path>
-            </svg>
-          </button>
-          <button class="hud-action danger" onclick={disconnectRemote} title="End Session">
-            ✕
-          </button>
-        </div>
+            <!-- Zoom Reset Button when pinched/zoomed -->
+            {#if zoomScale > 1.05}
+              <button class="hud-action zoom-reset-btn" onclick={resetZoom} title="Reset Zoom">
+                🔍 {Math.round(zoomScale * 100)}%
+              </button>
+            {/if}
+
+            <!-- On-Screen Virtual Keyboard Toggle -->
+            <button class="hud-action keyboard-btn" onclick={toggleVirtualKeyboard} title="Toggle Keyboard">
+              ⌨
+            </button>
+
+            <!-- Session Permission Badge -->
+            <div
+              class="hud-tag permission-badge"
+              class:badge-viewonly={clientAccessLevel === "ViewOnly"}
+              class:badge-standard={clientAccessLevel === "Standard"}
+              class:badge-full={clientAccessLevel === "FullAccess"}
+              title="Current Session Permission Level"
+            >
+              {#if clientAccessLevel === "ViewOnly"}
+                🔒 View Only
+              {:else if clientAccessLevel === "Standard"}
+                ⚡ Standard
+              {:else}
+                🛡 Full Access
+              {/if}
+            </div>
+
+            {#if remoteResolution.width > 0}
+              <div class="hud-tag res">{remoteResolution.width}x{remoteResolution.height}</div>
+            {/if}
+            <div class="hud-tag">{fps} FPS</div>
+            <div class="hud-tag">{rttMs} ms</div>
+            <button class="hud-action" onclick={toggleFullscreen} title="Exit Fullscreen">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"></path>
+              </svg>
+            </button>
+            <button class="hud-action danger" onclick={disconnectRemote} title="End Session">
+              ✕
+            </button>
+          </div>
+        {/if}
       </div>
     {:else}
       <!-- Unified AnyDesk-Style Dashboard -->
@@ -2379,13 +2487,16 @@
     justify-content: space-between;
     align-items: center;
     height: 42px;
-    background: rgba(15, 23, 42, 0.85);
+    background: rgba(15, 23, 42, 0.92);
     backdrop-filter: blur(14px);
     border-bottom: 1px solid rgba(255, 255, 255, 0.07);
     padding: 0 0 0 14px;
     user-select: none;
     z-index: 100;
     -webkit-app-region: drag;
+    box-sizing: border-box;
+    width: 100%;
+    position: relative;
   }
 
   .titlebar-left {
@@ -2393,6 +2504,8 @@
     align-items: center;
     gap: 10px;
     height: 100%;
+    flex: 1 1 0;
+    min-width: 0;
     -webkit-app-region: drag;
   }
 
@@ -2406,6 +2519,7 @@
     justify-content: center;
     color: #ffffff;
     box-shadow: 0 2px 8px rgba(2, 132, 199, 0.35);
+    flex-shrink: 0;
   }
 
   .titlebar-text {
@@ -2413,6 +2527,7 @@
     font-weight: 700;
     letter-spacing: -0.01em;
     color: #ffffff;
+    white-space: nowrap;
   }
 
   .network-pill {
@@ -2428,6 +2543,8 @@
     color: #38bdf8;
     margin-left: 6px;
     -webkit-app-region: no-drag;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .pill-dot {
@@ -2438,46 +2555,36 @@
   }
 
   .titlebar-center {
-    flex: 1;
+    flex: 2 1 auto;
     height: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
     -webkit-app-region: drag;
+    min-width: 0;
+    padding: 0 8px;
+    box-sizing: border-box;
   }
 
-  .session-status-chip {
-    display: flex;
+  /* Single Dedicated Horizontal Flex Container for Main Metrics & Remote Controls */
+  .header-metrics-container {
+    display: inline-flex;
     align-items: center;
-    gap: 6px;
-    background: rgba(34, 197, 94, 0.12);
-    border: 1px solid rgba(34, 197, 94, 0.3);
-    color: #4ade80;
-    padding: 2px 10px;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    font-weight: 600;
+    justify-content: center;
+    gap: 8px;
+    height: 100%;
     -webkit-app-region: no-drag;
-  }
-
-  .status-live-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: #22c55e;
-    animation: live-pulse 1.4s infinite;
-  }
-
-  @keyframes live-pulse {
-    0% { transform: scale(0.9); opacity: 0.6; }
-    50% { transform: scale(1.3); opacity: 1; }
-    100% { transform: scale(0.9); opacity: 0.6; }
+    box-sizing: border-box;
+    padding: 0 4px;
   }
 
   .titlebar-right {
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     height: 100%;
+    flex: 1 1 0;
+    min-width: 0;
     -webkit-app-region: no-drag;
   }
 
@@ -2863,31 +2970,64 @@
   .session-hud {
     position: absolute;
     top: 14px;
-    right: 20px;
-    background: rgba(15, 23, 42, 0.9);
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(15, 23, 42, 0.92);
     backdrop-filter: blur(14px);
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 8px;
-    padding: 6px 12px;
+    padding: 6px 14px;
     display: flex;
     align-items: center;
-    gap: 10px;
+    justify-content: center;
+    gap: 8px;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
     z-index: 100;
+    margin: 0 auto;
+    white-space: nowrap;
   }
 
   /* Multi-Monitor Switcher in Session */
   .monitor-switcher {
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: 5px;
-    padding-right: 8px;
+    padding: 0 8px;
+    border-left: 1px solid rgba(255, 255, 255, 0.12);
     border-right: 1px solid rgba(255, 255, 255, 0.12);
+    height: 24px;
+    box-sizing: border-box;
   }
 
   .switcher-title {
     font-size: 0.72rem;
     color: #64748b;
+    font-weight: 600;
+  }
+
+  .monitor-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #e2e8f0;
+    padding: 3px 9px;
+    border-radius: 5px;
+    font-size: 0.73rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    height: 24px;
+    box-sizing: border-box;
+  }
+
+  .monitor-badge .badge-icon {
+    font-size: 0.78rem;
+  }
+
+  .device-name {
+    color: #f8fafc;
     font-weight: 600;
   }
 
@@ -2901,6 +3041,10 @@
     font-weight: 600;
     cursor: pointer;
     transition: all 0.15s ease;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    box-sizing: border-box;
   }
 
   .btn-mon-pill:hover {
@@ -2917,10 +3061,20 @@
   }
 
   .hud-tag {
-    font-size: 0.74rem;
-    font-family: monospace;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 3px 8px;
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 0.72rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-weight: 600;
     color: #38bdf8;
+    white-space: nowrap;
+    height: 24px;
+    box-sizing: border-box;
   }
 
   .hud-tag.res {
@@ -2928,19 +3082,37 @@
   }
 
   .hud-action {
-    background: rgba(255, 255, 255, 0.08);
-    border: none;
-    color: #f1f5f9;
-    padding: 4px 8px;
-    border-radius: 4px;
-    cursor: pointer;
-    display: flex;
+    display: inline-flex;
     align-items: center;
+    justify-content: center;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #f1f5f9;
+    padding: 3px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 0.78rem;
+    transition: all 0.15s ease;
+    height: 24px;
+    box-sizing: border-box;
+    white-space: nowrap;
+  }
+
+  .hud-action:hover {
+    background: rgba(255, 255, 255, 0.14);
+    color: #ffffff;
+    border-color: rgba(255, 255, 255, 0.2);
   }
 
   .hud-action.danger {
     background: rgba(239, 68, 68, 0.2);
     color: #f87171;
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+
+  .hud-action.danger:hover {
+    background: #ef4444;
+    color: #ffffff;
   }
 
   /* Recent Sessions / History Section */
@@ -3133,12 +3305,16 @@
       min-width: 100% !important;
     }
     .session-hud {
+      top: auto;
       bottom: 12px;
-      right: 12px;
-      padding: 6px 10px;
+      left: 50%;
+      right: auto;
+      transform: translateX(-50%);
+      padding: 6px 12px;
       gap: 6px;
       max-width: calc(100vw - 24px);
       flex-wrap: wrap;
+      justify-content: center;
     }
     .hud-tag {
       font-size: 0.68rem;
@@ -3154,12 +3330,37 @@
     }
   }
 
+  @media (max-width: 1050px) {
+    .hud-tag.res {
+      display: none;
+    }
+  }
+
+  @media (max-width: 880px) {
+    .titlebar-text {
+      display: none;
+    }
+    .header-metrics-container {
+      gap: 5px;
+    }
+    .monitor-badge {
+      max-width: 110px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+  }
+
   /* HUD Permission Badge */
   .permission-badge {
-    padding: 3px 8px;
-    border-radius: 4px;
+    padding: 3px 9px;
+    border-radius: 5px;
     font-size: 0.72rem;
     font-weight: 700;
+    white-space: nowrap;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    box-sizing: border-box;
   }
   .badge-viewonly {
     background: rgba(234, 179, 8, 0.2);
