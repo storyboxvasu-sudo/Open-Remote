@@ -17,19 +17,26 @@ const sigFilePath = args[1];
 const artifactFilename = args[2];
 const repo = args[3] || process.env.GITHUB_REPOSITORY || 'storyboxvasu-sudo/Open-Remote';
 
-// Read default version from tauri.conf.json if available
-let defaultVersion = '1.0.0';
+// Read exact version from tauri.conf.json to guarantee the signature matches the announced version
+let tauriVersion = '1.0.10';
 try {
   const confPath = path.resolve(__dirname, '../app-ui/src-tauri/tauri.conf.json');
   if (fs.existsSync(confPath)) {
     const conf = JSON.parse(fs.readFileSync(confPath, 'utf8'));
-    if (conf.version) defaultVersion = conf.version;
+    if (conf.version) tauriVersion = conf.version;
   }
-} catch (e) {}
+} catch (e) {
+  console.warn("Could not read tauri.conf.json, falling back to", tauriVersion);
+}
 
-const rawTag = args[4] || process.env.GITHUB_REF_NAME || `v${defaultVersion}`;
+// The updater signature is mathematically tied to the version defined in tauri.conf.json.
+// Announcing any other version in latest.json causes updater verification failure.
+const version = tauriVersion;
+
+const rawTag = args[4] || process.env.GITHUB_REF_NAME || `v${tauriVersion}`;
 const tag = rawTag.startsWith('v') ? rawTag : `v${rawTag}`;
-const version = rawTag.startsWith('v') ? rawTag.replace(/^v/, '') : (rawTag === 'main' || rawTag === 'master' ? defaultVersion : rawTag);
+
+console.log(`[update-latest-json] Using exact application version from tauri.conf.json: ${version} (Tag: ${tag})`);
 
 if (!fs.existsSync(sigFilePath)) {
   console.error(`Signature file not found: ${sigFilePath}`);

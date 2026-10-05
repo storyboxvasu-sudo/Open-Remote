@@ -167,7 +167,7 @@
   let unlistenAuthDeclined: (() => void) | null = null;
 
   // Auto-Updater State
-  let currentAppVersion = $state("1.0.6");
+  let currentAppVersion = $state("1.0.10");
   let availableUpdate = $state<Update | null>(null);
   let isCheckingUpdate = $state(false);
   let isDownloadingUpdate = $state(false);
