@@ -27,7 +27,7 @@ pub enum NetError {
     Json(#[from] serde_json::Error),
     #[error("Codec error: {0}")]
     Codec(String),
-    #[error("Peer not found on local network: {0}")]
+    #[error("Peer not found: {0}")]
     PeerNotFound(String),
     #[error("Connection declined: {0}")]
     ConnectionDeclined(String),
@@ -1338,7 +1338,7 @@ pub async fn resolve_peer_id_on_lan(peer_id: &str, timeout_ms: u64) -> Result<So
     }
 
     Err(NetError::PeerNotFound(format!(
-        "Peer ID {} was not found on your local network. Please ensure the remote PC is running OpenRemote on the same Wi-Fi/LAN, or connect directly using its LAN IP address.",
+        "Peer ID {} is offline or not reachable. Please ensure the target is online.",
         peer_id
     )))
 }

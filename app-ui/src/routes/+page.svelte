@@ -648,15 +648,71 @@
     }
   }
 
+  interface ParsedTarget {
+    kind: "direct_ip" | "peer_id";
+    raw: string;
+    normalized: string;
+    port: number;
+  }
+
+  function parseConnectionTarget(input: string): ParsedTarget {
+    const raw = input.trim();
+    // 1. Check for 9-digit numeric ID: e.g. "901-435-944", "901 435 944", or "901435944"
+    const digitsOnly = raw.replace(/[\s-]/g, "");
+    if (/^\d{9}$/.test(digitsOnly)) {
+      return { kind: "peer_id", raw, normalized: digitsOnly, port: 44321 };
+    }
+
+    // 2. IPv4 with port: 192.168.1.100:44321
+    const ipv4WithPort = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/;
+    if (ipv4WithPort.test(raw)) {
+      const match = raw.match(ipv4WithPort)!;
+      return { kind: "direct_ip", raw, normalized: match[1], port: parseInt(match[2], 10) };
+    }
+
+    // 3. IPv4 plain: 192.168.1.100
+    const ipv4Plain = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/;
+    if (ipv4Plain.test(raw)) {
+      return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
+    }
+
+    // 4. IPv6 with port: [::1]:44321 or [fe80::1]:44321
+    const ipv6WithPort = /^\[([0-9a-fA-F:]+)\]:(\d+)$/;
+    if (ipv6WithPort.test(raw)) {
+      const match = raw.match(ipv6WithPort)!;
+      return { kind: "direct_ip", raw, normalized: `[${match[1]}]`, port: parseInt(match[2], 10) };
+    }
+
+    // 5. Host with port: desktop.local:44321, domain.com:5000
+    const hostWithPort = /^([a-zA-Z0-9.-]+):(\d+)$/;
+    if (hostWithPort.test(raw)) {
+      const match = raw.match(hostWithPort)!;
+      return { kind: "direct_ip", raw, normalized: match[1], port: parseInt(match[2], 10) };
+    }
+
+    // 6. Localhost or domain
+    if (raw.toLowerCase() === "localhost") {
+      return { kind: "direct_ip", raw, normalized: "127.0.0.1", port: 44321 };
+    }
+
+    // Fallback: If it contains dots or colons, treat as direct_ip; otherwise if digits, treat as peer ID
+    if (raw.includes(".") || raw.includes(":")) {
+      return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
+    }
+    if (/^\d+$/.test(digitsOnly)) {
+      return { kind: "peer_id", raw, normalized: digitsOnly, port: 44321 };
+    }
+    return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
+  }
+
   async function connectToRemote(passwordToUse?: string) {
     if (!targetAddress.trim() || isConnecting) return;
-    const rawTarget = targetAddress.trim();
-    const cleanTargetId = rawTarget.replace(/-/g, "");
-    const isNineDigitId = /^\d{9}$/.test(cleanTargetId);
+    const parsed = parseConnectionTarget(targetAddress);
+    const cleanKey = parsed.kind === "peer_id" ? parsed.normalized : parsed.raw;
 
     // Check saved credentials if no explicit password passed
     if (!passwordToUse) {
-      const savedPw = localStorage.getItem("openremote_saved_pw_" + cleanTargetId);
+      const savedPw = localStorage.getItem("openremote_saved_pw_" + cleanKey);
       if (savedPw) {
         passwordToUse = savedPw;
       }
@@ -665,65 +721,96 @@
     isConnecting = true;
     connectionError = "";
     authModalError = "";
-    pendingAuthTarget = rawTarget;
+    pendingAuthTarget = parsed.raw;
 
-    // WAN dialing over Google STUN WebRTC if 9-digit peer ID and signaling is online
-    if (isNineDigitId && signalingClient && signalingStatus === "online") {
-      hostStatusMessage = "Connecting to peer over WAN...";
+    // =========================================================================
+    // MODE 1: GLOBAL INTERNET 9-DIGIT ID (via WebSocket Signaling + Google STUN)
+    // =========================================================================
+    if (parsed.kind === "peer_id") {
       try {
-        if (webrtcSession) {
-          webrtcSession.close();
+        // Invoke backend connect_peer_id command to validate and retrieve config
+        const peerInfo: { success: boolean; target_id: string; signaling_url: string; stun_servers: string[] } =
+          await invoke("connect_peer_id", {
+            targetId: parsed.normalized,
+            password: passwordToUse || null,
+          });
+
+        if (signalingStatus === "connecting") {
+          hostStatusMessage = "Connecting to signaling server...";
+        } else if (signalingStatus === "online") {
+          hostStatusMessage = "Connecting to peer over WAN (Google STUN)...";
         }
-        webrtcSession = new WebRTCSession(signalingClient, systemInfo?.peer_id || "");
-        webrtcSession.onFrameData = (buffer) => {
-          handleStreamMessage(buffer);
-        };
-        webrtcSession.onControlMessage = (msg) => {
-          handleStreamMessage(JSON.stringify(msg));
-        };
-        webrtcSession.onConnected = () => {
-          console.log("[webrtc] Connected to peer over WAN");
-          isConnected = true;
-          isConnecting = false;
-          loadRecentSessions();
-          invoke("save_recent_session", { peerId: rawTarget, alias: null }).catch(() => {});
-          updateNetworkStatusBadge();
-        };
-        webrtcSession.onDisconnected = () => {
-          console.log("[webrtc] Session disconnected");
-          disconnectRemote();
-        };
-        webrtcSession.onError = (err) => {
-          console.warn("[webrtc] Error:", err);
-          connectionError = typeof err === "string" ? err : (err?.message || "WebRTC connection error");
-          isConnecting = false;
-          updateNetworkStatusBadge();
-        };
 
-        await webrtcSession.call(rawTarget);
-
-        // 12-second timeout for WAN signaling
-        setTimeout(() => {
-          if (isConnecting && !isConnected) {
-            if (!connectionError) {
-              connectionError = "Connection timed out. Partner ID is offline or not registered.";
-            }
+        if (signalingClient && (signalingStatus === "online" || signalingStatus === "connecting")) {
+          if (webrtcSession) {
+            webrtcSession.close();
+          }
+          webrtcSession = new WebRTCSession(signalingClient, systemInfo?.peer_id || "");
+          webrtcSession.onFrameData = (buffer) => {
+            handleStreamMessage(buffer);
+          };
+          webrtcSession.onControlMessage = (msg) => {
+            handleStreamMessage(JSON.stringify(msg));
+          };
+          webrtcSession.onConnected = () => {
+            console.log("[webrtc] Connected to peer over WAN");
+            isConnected = true;
+            isConnecting = false;
+            loadRecentSessions();
+            invoke("save_recent_session", { peerId: parsed.normalized, alias: null }).catch(() => {});
+            updateNetworkStatusBadge();
+          };
+          webrtcSession.onDisconnected = () => {
+            console.log("[webrtc] Session disconnected");
+            disconnectRemote();
+          };
+          webrtcSession.onError = (err) => {
+            console.warn("[webrtc] Error:", err);
+            const errStr = typeof err === "string" ? err : (err?.message || "WebRTC connection error");
+            connectionError = errStr.includes("offline") || errStr.includes("not registered")
+              ? "Peer is offline or not registered."
+              : errStr;
             isConnecting = false;
             updateNetworkStatusBadge();
-          }
-        }, 12000);
+          };
 
+          await webrtcSession.call(parsed.normalized);
+
+          // 12-second timeout for WAN signaling
+          setTimeout(() => {
+            if (isConnecting && !isConnected) {
+              if (!connectionError) {
+                connectionError = signalingStatus === "online"
+                  ? "Peer is offline or not registered."
+                  : "Connecting to signaling server timed out. Peer is offline.";
+              }
+              isConnecting = false;
+              updateNetworkStatusBadge();
+            }
+          }, 12000);
+          return;
+        } else {
+          connectionError = "Connecting to signaling server... (Signaling offline or unreachable)";
+          isConnecting = false;
+          updateNetworkStatusBadge();
+          return;
+        }
+      } catch (peerErr: any) {
+        connectionError = typeof peerErr === "string" ? peerErr : (peerErr?.message || "Failed to initialize Peer ID connection");
+        isConnecting = false;
+        updateNetworkStatusBadge();
         return;
-      } catch (wanErr: any) {
-        console.warn("[webrtc] WAN attempt failed, falling back to direct network:", wanErr);
       }
     }
 
-    // Direct LAN connection fallback
+    // =========================================================================
+    // MODE 2: DIRECT LAN / PUBLIC IP MODE (Bypasses signaling server completely)
+    // =========================================================================
     try {
-      const res: ClientConnectResult = await invoke("connect_to_remote", {
-        targetAddress: rawTarget,
-        port: 44321,
+      hostStatusMessage = `Connecting directly to ${parsed.normalized}:${parsed.port}...`;
+      const res: ClientConnectResult = await invoke("connect_direct_ip", {
+        targetIp: parsed.normalized,
+        port: parsed.port,
         password: passwordToUse || null,
       });
 
@@ -758,7 +845,7 @@
         authModalError = errMsg.includes("Incorrect") || errMsg.includes("password")
           ? "Incorrect password. Please try again."
           : errMsg;
-        localStorage.removeItem("openremote_saved_pw_" + cleanTargetId);
+        localStorage.removeItem("openremote_saved_pw_" + cleanKey);
         showAuthModal = true;
         setTimeout(() => {
           const el = document.getElementById("auth-remote-password-input");

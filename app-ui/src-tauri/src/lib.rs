@@ -62,6 +62,15 @@ pub struct ClientConnectResult {
     pub challenge: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConnectInfo {
+    pub success: bool,
+    pub target_id: String,
+    pub signaling_url: String,
+    pub stun_servers: Vec<String>,
+    pub status: String,
+}
+
 pub struct ActiveHost {
     pub peer_id: String,
     pub capturer: Arc<ScreenCapturer>,
@@ -359,31 +368,18 @@ async fn stop_hosting(state: State<'_, AppEngineState>) -> Result<bool, String> 
     }
 }
 
-#[tauri::command]
-async fn connect_to_remote(
-    target_address: Option<String>,
-    target_ip: Option<String>,
-    port: Option<u16>,
+async fn internal_connect_to_socket_addr(
+    target_addr: SocketAddr,
+    input_identifier: String,
     password: Option<String>,
-    state: State<'_, AppEngineState>,
+    state: &AppEngineState,
 ) -> Result<ClientConnectResult, String> {
     let mut client_guard = state.client.lock().await;
     if client_guard.is_some() {
         return Err("A remote session is already active".to_string());
     }
 
-    let input = target_address
-        .or(target_ip)
-        .ok_or_else(|| "Target address or Peer ID is required".to_string())?;
-
-    let default_port = port.unwrap_or(44321);
     let my_id = state.peer_id.clone();
-
-    // Resolves 9-digit Peer ID via LAN UDP discovery, direct IP, or IP:Port
-    let target_addr = resolve_target_address(&input, default_port, Some(&my_id))
-        .await
-        .map_err(|e| e)?;
-
     let client = DirectLanClient::connect_with_peer_id(target_addr, my_id)
         .await
         .map_err(|e| format!("Failed to initialize connection to {}: {:?}", target_addr, e))?;
@@ -466,7 +462,7 @@ async fn connect_to_remote(
 
     // Save successfully connected Peer ID or IP in recent history
     let mut config = PeerConfig::load();
-    config.add_recent(&input, None);
+    config.add_recent(&input_identifier, None);
 
     // Setup local loopback WebSocket server on ephemeral port for ultra-fast binary frame transfer
     let ws_listener = TcpListener::bind("127.0.0.1:0")
@@ -573,6 +569,95 @@ async fn connect_to_remote(
         requires_password: false,
         challenge: None,
     })
+}
+
+#[tauri::command]
+async fn connect_direct_ip(
+    target_ip: String,
+    port: Option<u16>,
+    password: Option<String>,
+    state: State<'_, AppEngineState>,
+) -> Result<ClientConnectResult, String> {
+    let raw = target_ip.trim();
+    if raw.is_empty() {
+        return Err("Target IP address cannot be empty".to_string());
+    }
+
+    let default_port = port.unwrap_or(44321);
+
+    // Direct SocketAddr check (e.g. 192.168.1.15:44321, [::1]:44321)
+    let target_addr = if let Ok(addr) = raw.parse::<SocketAddr>() {
+        addr
+    } else if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+        SocketAddr::new(ip, default_port)
+    } else {
+        // Hostname:Port or Hostname (e.g. localhost, desktop.local:44321)
+        let host_with_port = if raw.contains(':') {
+            raw.to_string()
+        } else {
+            format!("{}:{}", raw, default_port)
+        };
+        let mut addrs = tokio::net::lookup_host(&host_with_port)
+            .await
+            .map_err(|e| format!("Invalid direct target IP '{}': {}", raw, e))?;
+        addrs.next().ok_or_else(|| format!("Could not resolve target host: {}", raw))?
+    };
+
+    internal_connect_to_socket_addr(target_addr, raw.to_string(), password, &state).await
+}
+
+#[tauri::command]
+async fn connect_peer_id(
+    target_id: String,
+    _password: Option<String>,
+    _state: State<'_, AppEngineState>,
+) -> Result<PeerConnectInfo, String> {
+    let raw = target_id.trim();
+    let clean_id: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if clean_id.len() != 9 {
+        return Err("Partner ID must be a 9-digit numeric code (e.g. 901-435-944)".to_string());
+    }
+
+    let sig_url = get_signaling_url();
+    let stun_servers = vec![
+        "stun:stun.l.google.com:19302".to_string(),
+        "stun:stun1.l.google.com:19302".to_string(),
+        "stun:stun2.l.google.com:19302".to_string(),
+    ];
+
+    let mut config = PeerConfig::load();
+    config.add_recent(&clean_id, None);
+
+    Ok(PeerConnectInfo {
+        success: true,
+        target_id: clean_id,
+        signaling_url: sig_url,
+        stun_servers,
+        status: "ready".to_string(),
+    })
+}
+
+#[tauri::command]
+async fn connect_to_remote(
+    target_address: Option<String>,
+    target_ip: Option<String>,
+    port: Option<u16>,
+    password: Option<String>,
+    state: State<'_, AppEngineState>,
+) -> Result<ClientConnectResult, String> {
+    let input = target_address
+        .or(target_ip)
+        .ok_or_else(|| "Target address or Peer ID is required".to_string())?;
+
+    let default_port = port.unwrap_or(44321);
+    let my_id = state.peer_id.clone();
+
+    // Resolves 9-digit Peer ID via LAN UDP discovery, direct IP, or IP:Port
+    let target_addr = resolve_target_address(&input, default_port, Some(&my_id))
+        .await
+        .map_err(|e| e)?;
+
+    internal_connect_to_socket_addr(target_addr, input, password, &state).await
 }
 
 #[tauri::command]
@@ -1201,6 +1286,8 @@ pub fn run() {
             start_hosting,
             stop_hosting,
             connect_to_remote,
+            connect_direct_ip,
+            connect_peer_id,
             disconnect_remote,
             send_input,
             inject_host_input,
