@@ -88,9 +88,20 @@ jobs:
           echo "Target architecture: ${{ matrix.arch }}"
           echo "CFLAGS: ${{ matrix.cflags }}"
 
+      - name: Clean up existing mounted disk images
+        run: |
+          echo "=== Cleaning up any existing mounted disk images & temporary DMG files ==="
+          hdiutil info | grep '/Volumes/' | awk '{print $1}' | while read -r dev; do
+            hdiutil detach "$dev" -force || true
+          done
+          rm -rf /tmp/dmg.* || true
+          # Prevent Spotlight from indexing /tmp during packaging
+          sudo mdutil -i off /tmp || true
+
       - name: Build Tauri macOS DMG & Updater Bundle
         working-directory: app-ui
         env:
+          CI: "true"
           RUST_BACKTRACE: 1
           # Enforce system Xcode Clang and architecture
           CC: /usr/bin/clang
@@ -116,7 +127,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || secrets.TAURI_KEY_PASSWORD || '' }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || secrets.TAURI_KEY_PASSWORD || '' }}
         run: |
-          pnpm tauri build --target ${{ matrix.target }} --verbose
+          pnpm tauri build --target ${{ matrix.target }} --verbose || {
+            echo "Tauri build encountered an issue (e.g. hdiutil busy), cleaning up mounted disk images and retrying..."
+            hdiutil info | grep '/Volumes/' | awk '{print $1}' | while read -r dev; do
+              hdiutil detach "$dev" -force || true
+            done
+            rm -rf /tmp/dmg.* || true
+            sleep 3
+            pnpm tauri build --target ${{ matrix.target }} --verbose
+          }
 
       - name: Locate and Collect Release Artifacts
         env:

@@ -1,6 +1,6 @@
 {
   "name": "app-ui",
-  "version": "1.0.15",
+  "version": "1.0.16",
   "description": "OpenRemote Desktop UI",
   "type": "module",
   "scripts": {
