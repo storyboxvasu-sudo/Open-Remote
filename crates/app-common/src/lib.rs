@@ -305,7 +305,7 @@ pub enum InputEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
     Middle,
@@ -401,6 +401,8 @@ pub struct FrameMeta {
     pub active_monitor: Option<usize>,
     #[serde(default)]
     pub access_level: Option<AccessLevel>,
+    #[serde(default)]
+    pub host_input_active: Option<bool>,
 }
 
 /// Signaling protocol envelope

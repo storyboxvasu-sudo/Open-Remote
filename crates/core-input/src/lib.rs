@@ -1,6 +1,9 @@
 use app_common::{InputEvent, MouseButton};
+use std::collections::HashSet;
 use std::sync::RwLock;
 use thiserror::Error;
+
+pub const REMOTE_INPUT_TAG: usize = 0x52454D4F; // "REMO"
 
 #[derive(Error, Debug)]
 pub enum InputError {
@@ -13,6 +16,8 @@ pub enum InputError {
 pub struct InputInjector {
     /// Active target monitor bounds: (x, y, width, height)
     active_monitor: RwLock<(i32, i32, u32, u32)>,
+    held_keys: RwLock<HashSet<u32>>,
+    held_mouse_buttons: RwLock<HashSet<MouseButton>>,
 }
 
 impl InputInjector {
@@ -28,6 +33,8 @@ impl InputInjector {
             let initial_h = if h == 0 { 1080 } else { h };
             Self {
                 active_monitor: RwLock::new((0, 0, initial_w, initial_h)),
+                held_keys: RwLock::new(HashSet::new()),
+                held_mouse_buttons: RwLock::new(HashSet::new()),
             }
         }
         #[cfg(target_os = "macos")]
@@ -40,12 +47,16 @@ impl InputInjector {
             let h = if bounds.size.height > 0.0 { bounds.size.height as u32 } else { 1080 };
             Self {
                 active_monitor: RwLock::new((bounds.origin.x as i32, bounds.origin.y as i32, w, h)),
+                held_keys: RwLock::new(HashSet::new()),
+                held_mouse_buttons: RwLock::new(HashSet::new()),
             }
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             Self {
                 active_monitor: RwLock::new((0, 0, 1920, 1080)),
+                held_keys: RwLock::new(HashSet::new()),
+                held_mouse_buttons: RwLock::new(HashSet::new()),
             }
         }
     }
@@ -53,6 +64,28 @@ impl InputInjector {
     pub fn set_active_monitor_bounds(&self, x: i32, y: i32, width: u32, height: u32) {
         if let Ok(mut lock) = self.active_monitor.write() {
             *lock = (x, y, width, height);
+        }
+    }
+
+    pub fn release_all(&self) {
+        if let Ok(mut buttons) = self.held_mouse_buttons.write() {
+            let drained: Vec<MouseButton> = buttons.drain().collect();
+            for button in drained {
+                let _ = self.inject(&InputEvent::MouseUp {
+                    button,
+                    x: 0.5,
+                    y: 0.5,
+                });
+            }
+        }
+        if let Ok(mut keys) = self.held_keys.write() {
+            let drained: Vec<u32> = keys.drain().collect();
+            for scancode in drained {
+                let _ = self.inject(&InputEvent::KeyUp {
+                    scancode,
+                    key: String::new(),
+                });
+            }
         }
     }
 
@@ -79,6 +112,10 @@ impl InputInjector {
                     let target_y = mon_y + ((y.clamp(0.0, 1.0) * mon_h as f64).round() as i32);
                     SetCursorPos(target_x, target_y);
 
+                    if let Ok(mut set) = self.held_mouse_buttons.write() {
+                        set.insert(*button);
+                    }
+
                     let dw_flags = match button {
                         MouseButton::Left => MOUSEEVENTF_LEFTDOWN,
                         MouseButton::Right => MOUSEEVENTF_RIGHTDOWN,
@@ -93,7 +130,7 @@ impl InputInjector {
                                 mouseData: 0,
                                 dwFlags: dw_flags,
                                 time: 0,
-                                dwExtraInfo: 0,
+                                dwExtraInfo: REMOTE_INPUT_TAG,
                             },
                         },
                     };
@@ -103,6 +140,10 @@ impl InputInjector {
                     let target_x = mon_x + ((x.clamp(0.0, 1.0) * mon_w as f64).round() as i32);
                     let target_y = mon_y + ((y.clamp(0.0, 1.0) * mon_h as f64).round() as i32);
                     SetCursorPos(target_x, target_y);
+
+                    if let Ok(mut set) = self.held_mouse_buttons.write() {
+                        set.remove(button);
+                    }
 
                     let dw_flags = match button {
                         MouseButton::Left => MOUSEEVENTF_LEFTUP,
@@ -118,7 +159,7 @@ impl InputInjector {
                                 mouseData: 0,
                                 dwFlags: dw_flags,
                                 time: 0,
-                                dwExtraInfo: 0,
+                                dwExtraInfo: REMOTE_INPUT_TAG,
                             },
                         },
                     };
@@ -134,13 +175,16 @@ impl InputInjector {
                                 mouseData: *delta_y as u32,
                                 dwFlags: MOUSEEVENTF_WHEEL,
                                 time: 0,
-                                dwExtraInfo: 0,
+                                dwExtraInfo: REMOTE_INPUT_TAG,
                             },
                         },
                     };
                     SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
                 }
                 InputEvent::KeyDown { scancode, .. } => {
+                    if let Ok(mut set) = self.held_keys.write() {
+                        set.insert(*scancode);
+                    }
                     let mut input = INPUT {
                         r#type: INPUT_KEYBOARD,
                         Anonymous: INPUT_0 {
@@ -149,13 +193,16 @@ impl InputInjector {
                                 wScan: 0,
                                 dwFlags: 0,
                                 time: 0,
-                                dwExtraInfo: 0,
+                                dwExtraInfo: REMOTE_INPUT_TAG,
                             },
                         },
                     };
                     SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
                 }
                 InputEvent::KeyUp { scancode, .. } => {
+                    if let Ok(mut set) = self.held_keys.write() {
+                        set.remove(scancode);
+                    }
                     let mut input = INPUT {
                         r#type: INPUT_KEYBOARD,
                         Anonymous: INPUT_0 {
@@ -164,7 +211,7 @@ impl InputInjector {
                                 wScan: 0,
                                 dwFlags: KEYEVENTF_KEYUP,
                                 time: 0,
-                                dwExtraInfo: 0,
+                                dwExtraInfo: REMOTE_INPUT_TAG,
                             },
                         },
                     };
@@ -215,6 +262,10 @@ impl InputInjector {
                     let pos = CGPoint { x: target_x, y: target_y };
                     CGWarpMouseCursorPosition(pos);
 
+                    if let Ok(mut set) = self.held_mouse_buttons.write() {
+                        set.insert(*button);
+                    }
+
                     let (ev_type, btn) = match button {
                         MouseButton::Left => (kCGEventLeftMouseDown, kCGMouseButtonLeft),
                         MouseButton::Right => (kCGEventRightMouseDown, kCGMouseButtonRight),
@@ -236,6 +287,10 @@ impl InputInjector {
                     let target_y = mon_y as f64 + (y.clamp(0.0, 1.0) * mon_h as f64);
                     let pos = CGPoint { x: target_x, y: target_y };
                     CGWarpMouseCursorPosition(pos);
+
+                    if let Ok(mut set) = self.held_mouse_buttons.write() {
+                        set.remove(button);
+                    }
 
                     let (ev_type, btn) = match button {
                         MouseButton::Left => (kCGEventLeftMouseUp, kCGMouseButtonLeft),
@@ -266,6 +321,9 @@ impl InputInjector {
                     }
                 }
                 InputEvent::KeyDown { scancode, key } => {
+                    if let Ok(mut set) = self.held_keys.write() {
+                        set.insert(*scancode);
+                    }
                     let key_code = map_key_to_macos_keycode(*scancode, key);
                     let ev = CGEventCreateKeyboardEvent(
                         std::ptr::null_mut(),
@@ -278,6 +336,9 @@ impl InputInjector {
                     }
                 }
                 InputEvent::KeyUp { scancode, key } => {
+                    if let Ok(mut set) = self.held_keys.write() {
+                        set.remove(scancode);
+                    }
                     let key_code = map_key_to_macos_keycode(*scancode, key);
                     let ev = CGEventCreateKeyboardEvent(
                         std::ptr::null_mut(),
@@ -465,3 +526,108 @@ pub mod macos_input {
         }
     }
 }
+
+pub use host_input_monitor::{ensure_host_input_monitor, is_host_input_active};
+
+#[cfg(target_os = "windows")]
+mod host_input_monitor {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+    static LAST_PHYSICAL_INPUT_MS: AtomicU64 = AtomicU64::new(0);
+    static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
+
+    fn current_time_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    unsafe extern "system" fn low_level_mouse_proc(
+        n_code: i32,
+        w_param: usize,
+        l_param: isize,
+    ) -> isize {
+        if n_code >= 0 {
+            let mouse_info = *(l_param as *const MSLLHOOKSTRUCT);
+            // LLMHF_INJECTED = 0x00000001
+            // If LLMHF_INJECTED is not set and dwExtraInfo is not our remote injection tag:
+            if (mouse_info.flags & LLMHF_INJECTED) == 0 && mouse_info.dwExtraInfo != crate::REMOTE_INPUT_TAG {
+                LAST_PHYSICAL_INPUT_MS.store(current_time_ms(), Ordering::Relaxed);
+            }
+        }
+        CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param)
+    }
+
+    unsafe extern "system" fn low_level_keyboard_proc(
+        n_code: i32,
+        w_param: usize,
+        l_param: isize,
+    ) -> isize {
+        if n_code >= 0 {
+            let kbd_info = *(l_param as *const KBDLLHOOKSTRUCT);
+            // LLKHF_INJECTED = 0x00000010
+            // If LLKHF_INJECTED is not set and dwExtraInfo is not our remote injection tag:
+            if (kbd_info.flags & LLKHF_INJECTED) == 0 && kbd_info.dwExtraInfo != crate::REMOTE_INPUT_TAG {
+                LAST_PHYSICAL_INPUT_MS.store(current_time_ms(), Ordering::Relaxed);
+            }
+        }
+        CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param)
+    }
+
+    pub fn ensure_host_input_monitor() {
+        if MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        std::thread::Builder::new()
+            .name("host-input-monitor".to_string())
+            .spawn(move || unsafe {
+                let mouse_hook = SetWindowsHookExW(
+                    WH_MOUSE_LL,
+                    Some(low_level_mouse_proc),
+                    std::ptr::null_mut(),
+                    0,
+                );
+                let kbd_hook = SetWindowsHookExW(
+                    WH_KEYBOARD_LL,
+                    Some(low_level_keyboard_proc),
+                    std::ptr::null_mut(),
+                    0,
+                );
+
+                let mut msg: MSG = std::mem::zeroed();
+                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                    DispatchMessageW(&msg);
+                }
+
+                if !mouse_hook.is_null() {
+                    UnhookWindowsHookEx(mouse_hook);
+                }
+                if !kbd_hook.is_null() {
+                    UnhookWindowsHookEx(kbd_hook);
+                }
+                MONITOR_RUNNING.store(false, Ordering::SeqCst);
+            })
+            .ok();
+    }
+
+    pub fn is_host_input_active(cooldown_ms: u64) -> bool {
+        let last = LAST_PHYSICAL_INPUT_MS.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = current_time_ms();
+        now.saturating_sub(last) < cooldown_ms
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod host_input_monitor {
+    pub fn ensure_host_input_monitor() {}
+    pub fn is_host_input_active(_cooldown_ms: u64) -> bool {
+        false
+    }
+}
+

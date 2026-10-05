@@ -213,6 +213,7 @@ impl DirectLanHost {
     }
 
     pub fn with_peer_id(base_port: u16, peer_id: String, capturer: Arc<ScreenCapturer>) -> Self {
+        core_input::ensure_host_input_monitor();
         Self {
             peer_id,
             control_port: base_port,
@@ -265,6 +266,7 @@ impl DirectLanHost {
 
     /// Starts the background listener for incoming control events over direct LAN UDP with socket reuse
     pub async fn start_input_listener(&self) -> Result<(), NetError> {
+        core_input::ensure_host_input_monitor();
         let addr: SocketAddr = format!("0.0.0.0:{}", self.control_port)
             .parse()
             .map_err(|e: std::net::AddrParseError| NetError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
@@ -275,10 +277,30 @@ impl DirectLanHost {
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            let mut was_locked = false;
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, _peer_addr)) => {
                         if let Ok(event) = serde_json::from_slice::<InputEvent>(&buf[..len]) {
+                            // Local Hardware Input Priority: check physical host input cooldown (1500ms)
+                            let is_locked = core_input::is_host_input_active(1500);
+                            if is_locked {
+                                if !was_locked {
+                                    was_locked = true;
+                                    injector.release_all();
+                                }
+                                // Allow monitor switching even when input is locked
+                                if let InputEvent::SwitchMonitor { monitor_index } = &event {
+                                    let _ = capturer.switch_monitor(*monitor_index);
+                                    let monitors = ScreenCapturer::enumerate_monitors();
+                                    if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
+                                        injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
+                                    }
+                                }
+                                continue;
+                            }
+                            was_locked = false;
+
                             let current_level = *access_level_lock.read();
                             match current_level {
                                 AccessLevel::ViewOnly => {
@@ -632,10 +654,13 @@ impl DirectLanHost {
                         let mut last_monitor = cap.active_monitor_index();
                         let mut send_monitors = true;
                         let mut last_send_time = tokio::time::Instant::now();
+                        let mut last_locked_state: Option<bool> = None;
 
                         loop {
                             let current_seq = cap.frame_counter();
                             let current_mon = cap.active_monitor_index();
+                            let is_locked = core_input::is_host_input_active(1500);
+                            let lock_changed = last_locked_state != Some(is_locked);
 
                             if current_mon != last_monitor {
                                 last_monitor = current_mon;
@@ -643,8 +668,14 @@ impl DirectLanHost {
                                 enc.reset();
                             }
 
+                            if lock_changed {
+                                last_locked_state = Some(is_locked);
+                                enc.reset();
+                            }
+
                             let should_send = (current_seq != last_seq)
                                 || (last_seq == 0)
+                                || lock_changed
                                 || (last_send_time.elapsed().as_millis() >= 500);
 
                             if should_send {
@@ -657,6 +688,7 @@ impl DirectLanHost {
                                                 send_monitors = false;
                                             }
                                             compressed.meta.access_level = Some(*access_lvl_clone.read());
+                                            compressed.meta.host_input_active = Some(is_locked);
 
                                             let meta_bytes = serde_json::to_vec(&compressed.meta).unwrap_or_default();
                                             let meta_len = meta_bytes.len() as u32;

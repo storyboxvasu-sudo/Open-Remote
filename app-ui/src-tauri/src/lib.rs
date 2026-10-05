@@ -413,6 +413,8 @@ async fn connect_to_remote(
                 })).unwrap_or_default();
                 let _ = ws_stream.send(Message::Text(init_perm_json.into())).await;
 
+                let mut last_forwarded_lock: Option<bool> = None;
+
                 while !stop_flag_clone.load(Ordering::Relaxed) {
                     match read_remote_frame(&mut video_stream, &encoder).await {
                         Ok((meta, raw_pixels)) => {
@@ -447,6 +449,18 @@ async fn connect_to_remote(
                                     "access_level": lvl,
                                 })).unwrap_or_default();
                                 let _ = ws_stream.send(Message::Text(perm_json.into())).await;
+                            }
+
+                            // Forward host physical input lockout state
+                            if let Some(locked) = meta.host_input_active {
+                                if last_forwarded_lock != Some(locked) {
+                                    last_forwarded_lock = Some(locked);
+                                    let lock_json = serde_json::to_string(&serde_json::json!({
+                                        "type": "host_input_active",
+                                        "locked": locked,
+                                    })).unwrap_or_default();
+                                    let _ = ws_stream.send(Message::Text(lock_json.into())).await;
+                                }
                             }
 
                             // Optimized Packet structure with dirty rect header (36 bytes header + pixels):
