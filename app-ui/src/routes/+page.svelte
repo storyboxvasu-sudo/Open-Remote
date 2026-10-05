@@ -153,11 +153,18 @@
   let setPasswordError = $state("");
   let isSavingPassword = $state(false);
 
-  // Client-side Remote Device Password Challenge Modal
-  let showClientPasswordModal = $state(false);
-  let clientPasswordInput = $state("");
-  let showClientPasswordText = $state(false);
-  let clientPasswordError = $state("");
+  // Client-side Unattended Access Authorization Modal State (AnyDesk Style)
+  let showAuthModal = $state(false);
+  let authPasswordInput = $state("");
+  let showAuthPasswordText = $state(false);
+  let authModalRemember = $state(false);
+  let authModalError = $state("");
+  let isSubmittingAuth = $state(false);
+  let pendingAuthTarget = $state("");
+  let unlistenAuthRequired: (() => void) | null = null;
+  let unlistenAuthSuccess: (() => void) | null = null;
+  let unlistenAuthFailed: (() => void) | null = null;
+  let unlistenAuthDeclined: (() => void) | null = null;
 
   // Auto-Updater State
   let currentAppVersion = $state("1.0.6");
@@ -536,9 +543,20 @@
 
   async function connectToRemote(passwordToUse?: string) {
     if (!targetAddress.trim() || isConnecting) return;
+    const cleanTargetId = targetAddress.trim().replace(/-/g, "");
+
+    // Check saved credentials if no explicit password passed
+    if (!passwordToUse) {
+      const savedPw = localStorage.getItem("openremote_saved_pw_" + cleanTargetId);
+      if (savedPw) {
+        passwordToUse = savedPw;
+      }
+    }
+
     isConnecting = true;
     connectionError = "";
-    clientPasswordError = "";
+    authModalError = "";
+    pendingAuthTarget = targetAddress.trim();
 
     try {
       const res: ClientConnectResult = await invoke("connect_to_remote", {
@@ -549,18 +567,23 @@
 
       if (res.requires_password) {
         isConnecting = false;
-        showClientPasswordModal = true;
-        clientPasswordInput = "";
-        clientPasswordError = "";
+        showAuthModal = true;
+        authPasswordInput = "";
+        authModalError = "";
+        setTimeout(() => {
+          const el = document.getElementById("auth-remote-password-input");
+          if (el) el.focus();
+        }, 50);
         return;
       }
 
       if (res.success) {
-        showClientPasswordModal = false;
-        clientPasswordInput = "";
-        clientPasswordError = "";
+        showAuthModal = false;
+        authPasswordInput = "";
+        authModalError = "";
         isConnected = true;
         isConnecting = false;
+        isSubmittingAuth = false;
         if (res.initial_access_level) {
           clientAccessLevel = res.initial_access_level;
         }
@@ -569,14 +592,57 @@
       }
     } catch (err: any) {
       const errMsg = typeof err === "string" ? err : JSON.stringify(err);
-      if (showClientPasswordModal) {
-        clientPasswordError = errMsg.includes("Incorrect") ? "Incorrect Password. Please try again." : errMsg;
+      if (showAuthModal || errMsg.includes("password") || errMsg.includes("Incorrect")) {
+        authModalError = errMsg.includes("Incorrect") || errMsg.includes("password")
+          ? "Incorrect password. Please try again."
+          : errMsg;
+        localStorage.removeItem("openremote_saved_pw_" + cleanTargetId);
+        showAuthModal = true;
+        setTimeout(() => {
+          const el = document.getElementById("auth-remote-password-input");
+          if (el) el.focus();
+        }, 50);
       } else {
         connectionError = errMsg;
       }
       isConnecting = false;
       isConnected = false;
+      isSubmittingAuth = false;
     }
+  }
+
+  async function submitAuthModal() {
+    if (!authPasswordInput.trim() || isSubmittingAuth) return;
+    isSubmittingAuth = true;
+    authModalError = "";
+    const pwd = authPasswordInput.trim();
+    const cleanTargetId = targetAddress.trim().replace(/-/g, "");
+
+    if (authModalRemember) {
+      localStorage.setItem("openremote_saved_pw_" + cleanTargetId, pwd);
+    } else {
+      localStorage.removeItem("openremote_saved_pw_" + cleanTargetId);
+    }
+
+    try {
+      await invoke("submit_auth_password", { password: pwd });
+    } catch (_err) {
+      await connectToRemote(pwd);
+    }
+  }
+
+  async function cancelAuthModal() {
+    showAuthModal = false;
+    authPasswordInput = "";
+    authModalError = "";
+    isSubmittingAuth = false;
+    isConnecting = false;
+    try {
+      await invoke("cancel_auth");
+    } catch (_e) {}
+    try {
+      await invoke("disconnect_remote");
+    } catch (_e) {}
   }
 
   async function disconnectRemote() {
@@ -1159,6 +1225,38 @@
     }, 1000);
 
     try {
+      unlistenAuthRequired = await listen("auth-required", (_event) => {
+        showAuthModal = true;
+        authModalError = "";
+        authPasswordInput = "";
+        isSubmittingAuth = false;
+        setTimeout(() => {
+          const el = document.getElementById("auth-remote-password-input");
+          if (el) el.focus();
+        }, 50);
+      });
+
+      unlistenAuthSuccess = await listen("auth-success", () => {
+        showAuthModal = false;
+        authModalError = "";
+        authPasswordInput = "";
+        isSubmittingAuth = false;
+      });
+
+      unlistenAuthFailed = await listen<{ type: string; reason: string }>("auth-failed", (event) => {
+        authModalError = event.payload?.reason || "Incorrect password. Please try again.";
+        isSubmittingAuth = false;
+        const cleanTargetId = targetAddress.trim().replace(/-/g, "");
+        localStorage.removeItem("openremote_saved_pw_" + cleanTargetId);
+      });
+
+      unlistenAuthDeclined = await listen<{ type: string; reason: string }>("auth-declined", (event) => {
+        showAuthModal = false;
+        connectionError = event.payload?.reason || "Connection declined by host";
+        isConnecting = false;
+        isSubmittingAuth = false;
+      });
+
       unlistenIncoming = await listen<IncomingRequestInfo>("incoming-connection-request", (event) => {
         incomingRequest = event.payload;
         showIncomingModal = true;
@@ -1169,6 +1267,10 @@
 
       unlistenSession = await listen<HostSessionInfo>("session-status-changed", (event) => {
         hostSession = event.payload;
+        if (hostSession && hostSession.is_active) {
+          showIncomingModal = false;
+          incomingRequest = null;
+        }
       });
     } catch (err) {
       console.error("Failed to attach event listeners:", err);
@@ -1190,6 +1292,10 @@
     if (animFrameId) cancelAnimationFrame(animFrameId);
     if (fpsInterval) clearInterval(fpsInterval);
     if (ws) ws.close();
+    if (unlistenAuthRequired) unlistenAuthRequired();
+    if (unlistenAuthSuccess) unlistenAuthSuccess();
+    if (unlistenAuthFailed) unlistenAuthFailed();
+    if (unlistenAuthDeclined) unlistenAuthDeclined();
     if (unlistenIncoming) unlistenIncoming();
     if (unlistenSession) unlistenSession();
   });
@@ -2372,10 +2478,10 @@
       </div>
     {/if}
 
-    <!-- Client Password Challenge Modal Dialog (When connecting to an Unattended Remote Host) -->
-    {#if showClientPasswordModal}
+    <!-- Client Unattended Access Authorization Modal Dialog (AnyDesk Dark Mode) -->
+    {#if showAuthModal}
       <div class="modal-backdrop">
-        <div class="modal-card password-modal-card">
+        <div class="modal-card auth-modal-card">
           <div class="modal-header">
             <div class="modal-badge-icon auth-badge-icon">
               <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
@@ -2383,31 +2489,42 @@
                 <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
               </svg>
             </div>
-            <div>
-              <h3 class="modal-title">Enter Password for Remote Device</h3>
-              <p class="modal-subtitle">Remote Host <strong>{targetAddress}</strong> requires authentication</p>
+            <div class="auth-modal-header-text">
+              <h3 class="modal-title">Authorization</h3>
+              <p class="modal-subtitle">Remote password or user confirmation required.</p>
             </div>
           </div>
 
           <div class="modal-form-body">
+            <div class="auth-target-info">
+              <span class="auth-target-label">Connecting to:</span>
+              <span class="auth-target-id">{pendingAuthTarget || targetAddress}</span>
+            </div>
+
             <div class="input-field-group">
-              <label for="client-remote-pwd">Password</label>
+              <label for="auth-remote-password-input">Password</label>
               <div class="password-input-wrap">
+                <!-- svelte-ignore a11y_autofocus -->
                 <input
-                  id="client-remote-pwd"
-                  type={showClientPasswordText ? "text" : "password"}
-                  placeholder="Enter remote unattended password"
-                  bind:value={clientPasswordInput}
+                  id="auth-remote-password-input"
+                  type={showAuthPasswordText ? "text" : "password"}
+                  placeholder="Enter remote password"
+                  bind:value={authPasswordInput}
                   class="modal-input"
-                  onkeydown={(e) => { if (e.key === "Enter") connectToRemote(clientPasswordInput); }}
+                  autofocus
+                  onkeydown={(e) => {
+                    if (e.key === "Enter" && authPasswordInput.trim() && !isSubmittingAuth) {
+                      submitAuthModal();
+                    }
+                  }}
                 />
                 <button
                   type="button"
                   class="btn-eye"
-                  onclick={() => (showClientPasswordText = !showClientPasswordText)}
-                  title={showClientPasswordText ? "Hide password" : "Show password"}
+                  onclick={() => (showAuthPasswordText = !showAuthPasswordText)}
+                  title={showAuthPasswordText ? "Hide password" : "Show password"}
                 >
-                  {#if showClientPasswordText}
+                  {#if showAuthPasswordText}
                     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
                       <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
                       <line x1="1" y1="1" x2="23" y2="23"></line>
@@ -2422,36 +2539,49 @@
               </div>
             </div>
 
-            {#if clientPasswordError}
-              <div class="modal-error-alert">
-                <span>⚠</span> {clientPasswordError}
+            {#if authModalError}
+              <div class="modal-error-alert auth-error-alert">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <line x1="12" y1="8" x2="12" y2="12"></line>
+                  <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                </svg>
+                <span>{authModalError}</span>
               </div>
             {/if}
+
+            <div class="auth-checkbox-row">
+              <label class="auth-checkbox-label">
+                <input
+                  type="checkbox"
+                  class="auth-checkbox"
+                  bind:checked={authModalRemember}
+                />
+                <span class="auth-checkbox-text">Log in automatically from now on</span>
+              </label>
+            </div>
           </div>
 
-          <div class="modal-actions">
+          <div class="modal-actions auth-modal-actions">
             <button
               type="button"
               class="btn-decline"
-              onclick={() => {
-                showClientPasswordModal = false;
-                clientPasswordInput = "";
-                clientPasswordError = "";
-              }}
+              disabled={isSubmittingAuth}
+              onclick={cancelAuthModal}
             >
               Cancel
             </button>
             <button
               type="button"
-              class="btn-accept"
-              disabled={isConnecting}
-              onclick={() => connectToRemote(clientPasswordInput)}
+              class="btn-accept btn-auth-ok"
+              disabled={!authPasswordInput.trim() || isSubmittingAuth}
+              onclick={submitAuthModal}
             >
-              {#if isConnecting}
+              {#if isSubmittingAuth}
                 <span class="btn-spinner"></span>
-                <span>Connecting...</span>
+                <span>Authenticating...</span>
               {:else}
-                Connect
+                OK
               {/if}
             </button>
           </div>
@@ -4427,5 +4557,107 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+
+  /* AnyDesk Dark Mode Authorization Modal */
+  .auth-modal-card {
+    max-width: 440px;
+    background: #0f172a;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.75);
+    border-radius: 12px;
+  }
+
+  .auth-modal-header-text {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .auth-target-info {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 0.8rem;
+  }
+
+  .auth-target-label {
+    color: #94a3b8;
+  }
+
+  .auth-target-id {
+    font-family: monospace;
+    font-weight: 700;
+    color: #38bdf8;
+    letter-spacing: 0.5px;
+  }
+
+  .auth-checkbox-row {
+    margin-top: 2px;
+  }
+
+  .auth-checkbox-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.82rem;
+    color: #cbd5e1;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .auth-checkbox {
+    width: 15px;
+    height: 15px;
+    accent-color: #0284c7;
+    cursor: pointer;
+  }
+
+  .auth-checkbox-text {
+    line-height: 1.2;
+  }
+
+  .auth-error-alert {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    color: #fca5a5;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .auth-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 8px;
+  }
+
+  .btn-auth-ok {
+    flex: 1;
+    background: #0284c7;
+    border: 1px solid #38bdf8;
+    color: #ffffff;
+    font-weight: 700;
+    transition: all 0.15s ease;
+  }
+
+  .btn-auth-ok:hover:not(:disabled) {
+    background: #0369a1;
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
+  }
+
+  .btn-auth-ok:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    background: rgba(2, 132, 199, 0.4);
+    border-color: rgba(56, 189, 248, 0.2);
   }
 </style>

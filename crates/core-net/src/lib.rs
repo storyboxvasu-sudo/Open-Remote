@@ -357,7 +357,7 @@ impl DirectLanHost {
                         if stream.read_exact(&mut req_buf).await.is_err() {
                             return;
                         }
-                        let mut handshake_req: ConnectionHandshakeRequest = match serde_json::from_slice(&req_buf) {
+                        let handshake_req: ConnectionHandshakeRequest = match serde_json::from_slice(&req_buf) {
                             Ok(r) => r,
                             Err(_) => return,
                         };
@@ -376,47 +376,9 @@ impl DirectLanHost {
                         let u_cfg = unattended_cfg_lock.read().clone();
                         let (accepted, chosen_level) = if u_cfg.enabled && u_cfg.password_hash.is_some() {
                             // Unattended Access is enabled on Host
-                            if handshake_req.auth_response.is_none() {
-                                // Send AuthChallenge to Client
-                                let challenge_resp = ConnectionHandshakeResponse {
-                                    accepted: false,
-                                    access_level: u_cfg.profile,
-                                    reason: Some("REQUEST_PASSWORD".to_string()),
-                                    auth_challenge: Some(AuthChallenge {
-                                        challenge: "REQUEST_PASSWORD".to_string(),
-                                        salt: u_cfg.salt.clone().unwrap_or_default(),
-                                    }),
-                                    auth_result: None,
-                                };
-                                let resp_bytes = serde_json::to_vec(&challenge_resp).unwrap_or_default();
-                                let resp_len = (resp_bytes.len() as u32).to_be_bytes();
-                                if stream.write_all(&resp_len).await.is_err() || stream.write_all(&resp_bytes).await.is_err() {
-                                    return;
-                                }
-
-                                // Wait for follow-up AuthResponse from client
-                                let mut next_len_buf = [0u8; 4];
-                                if tokio::time::timeout(tokio::time::Duration::from_secs(60), stream.read_exact(&mut next_len_buf)).await.is_err() {
-                                    return;
-                                }
-                                let next_len = u32::from_be_bytes(next_len_buf) as usize;
-                                if next_len > 65535 {
-                                    return;
-                                }
-                                let mut next_buf = vec![0u8; next_len];
-                                if stream.read_exact(&mut next_buf).await.is_err() {
-                                    return;
-                                }
-                                if let Ok(next_req) = serde_json::from_slice::<ConnectionHandshakeRequest>(&next_buf) {
-                                    handshake_req = next_req;
-                                } else {
-                                    return;
-                                }
-                            }
-
-                            // Verify client password hash
                             if let Some(auth_resp) = &handshake_req.auth_response {
-                                let expected_hash = u_cfg.password_hash.unwrap_or_default();
+                                // Client provided credentials upfront (e.g. remembered password)
+                                let expected_hash = u_cfg.password_hash.clone().unwrap_or_default();
                                 if auth_resp.hash.eq_ignore_ascii_case(&expected_hash) {
                                     let chosen = u_cfg.profile;
                                     let success_resp = ConnectionHandshakeResponse {
@@ -440,12 +402,12 @@ impl DirectLanHost {
                                     let fail_resp = ConnectionHandshakeResponse {
                                         accepted: false,
                                         access_level: AccessLevel::Standard,
-                                        reason: Some("Incorrect Password".to_string()),
+                                        reason: Some("Incorrect password".to_string()),
                                         auth_challenge: None,
                                         auth_result: Some(AuthResult {
                                             success: false,
                                             profile: None,
-                                            reason: Some("Incorrect Password".to_string()),
+                                            reason: Some("Incorrect password".to_string()),
                                         }),
                                     };
                                     let resp_bytes = serde_json::to_vec(&fail_resp).unwrap_or_default();
@@ -456,8 +418,168 @@ impl DirectLanHost {
                                     return;
                                 }
                             } else {
-                                let _ = stream.shutdown().await;
-                                return;
+                                // 1. Send AuthChallenge to Client
+                                let challenge_resp = ConnectionHandshakeResponse {
+                                    accepted: false,
+                                    access_level: u_cfg.profile,
+                                    reason: Some("REQUEST_PASSWORD".to_string()),
+                                    auth_challenge: Some(AuthChallenge {
+                                        challenge: "REQUEST_PASSWORD".to_string(),
+                                        salt: u_cfg.salt.clone().unwrap_or_default(),
+                                    }),
+                                    auth_result: None,
+                                };
+                                let resp_bytes = serde_json::to_vec(&challenge_resp).unwrap_or_default();
+                                let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+                                if stream.write_all(&resp_len).await.is_err() || stream.write_all(&resp_bytes).await.is_err() {
+                                    return;
+                                }
+
+                                // 2. Hold connection in pending state (30s timeout) and concurrently display Host Accept/Reject prompt
+                                let prompt_cb = cb_opt.clone();
+                                let host_info = IncomingRequestInfo {
+                                    request_id: request_id.clone(),
+                                    client_peer_id: client_peer_id.clone(),
+                                    client_ip: client_ip.clone(),
+                                };
+                                let host_prompt_fut = async {
+                                    if let Some(cb) = prompt_cb {
+                                        cb(host_info).await
+                                    } else {
+                                        futures_util::future::pending::<(bool, AccessLevel)>().await
+                                    }
+                                };
+                                tokio::pin!(host_prompt_fut);
+
+                                let auth_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(30));
+                                tokio::pin!(auth_timeout);
+
+                                tokio::select! {
+                                    _ = &mut auth_timeout => {
+                                        let timeout_resp = ConnectionHandshakeResponse {
+                                            accepted: false,
+                                            access_level: AccessLevel::Standard,
+                                            reason: Some("Authentication timed out".to_string()),
+                                            auth_challenge: None,
+                                            auth_result: Some(AuthResult {
+                                                success: false,
+                                                profile: None,
+                                                reason: Some("Authentication timed out".to_string()),
+                                            }),
+                                        };
+                                        let resp_bytes = serde_json::to_vec(&timeout_resp).unwrap_or_default();
+                                        let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+                                        let _ = stream.write_all(&resp_len).await;
+                                        let _ = stream.write_all(&resp_bytes).await;
+                                        let _ = stream.shutdown().await;
+                                        return;
+                                    }
+
+                                    (host_accepted, host_chosen_level) = &mut host_prompt_fut => {
+                                        if host_accepted {
+                                            let success_resp = ConnectionHandshakeResponse {
+                                                accepted: true,
+                                                access_level: host_chosen_level,
+                                                reason: None,
+                                                auth_challenge: None,
+                                                auth_result: Some(AuthResult {
+                                                    success: true,
+                                                    profile: Some(host_chosen_level),
+                                                    reason: None,
+                                                }),
+                                            };
+                                            let resp_bytes = serde_json::to_vec(&success_resp).unwrap_or_default();
+                                            let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+                                            if stream.write_all(&resp_len).await.is_err() || stream.write_all(&resp_bytes).await.is_err() {
+                                                return;
+                                            }
+                                            (true, host_chosen_level)
+                                        } else {
+                                            let decline_resp = ConnectionHandshakeResponse {
+                                                accepted: false,
+                                                access_level: AccessLevel::Standard,
+                                                reason: Some("Connection declined by remote host".to_string()),
+                                                auth_challenge: None,
+                                                auth_result: Some(AuthResult {
+                                                    success: false,
+                                                    profile: None,
+                                                    reason: Some("Connection declined by remote host".to_string()),
+                                                }),
+                                            };
+                                            let resp_bytes = serde_json::to_vec(&decline_resp).unwrap_or_default();
+                                            let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+                                            let _ = stream.write_all(&resp_len).await;
+                                            let _ = stream.write_all(&resp_bytes).await;
+                                            let _ = stream.shutdown().await;
+                                            return;
+                                        }
+                                    }
+
+                                    client_res = async {
+                                        let mut next_len_buf = [0u8; 4];
+                                        stream.read_exact(&mut next_len_buf).await?;
+                                        let next_len = u32::from_be_bytes(next_len_buf) as usize;
+                                        if next_len > 65535 {
+                                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Payload too large"));
+                                        }
+                                        let mut next_buf = vec![0u8; next_len];
+                                        stream.read_exact(&mut next_buf).await?;
+                                        serde_json::from_slice::<ConnectionHandshakeRequest>(&next_buf)
+                                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                                    } => {
+                                        match client_res {
+                                            Ok(next_req) => {
+                                                if let Some(auth_resp) = next_req.auth_response {
+                                                    let expected_hash = u_cfg.password_hash.clone().unwrap_or_default();
+                                                    if auth_resp.hash.eq_ignore_ascii_case(&expected_hash) {
+                                                        let chosen = u_cfg.profile;
+                                                        let success_resp = ConnectionHandshakeResponse {
+                                                            accepted: true,
+                                                            access_level: chosen,
+                                                            reason: None,
+                                                            auth_challenge: None,
+                                                            auth_result: Some(AuthResult {
+                                                                success: true,
+                                                                profile: Some(chosen),
+                                                                reason: None,
+                                                            }),
+                                                        };
+                                                        let resp_bytes = serde_json::to_vec(&success_resp).unwrap_or_default();
+                                                        let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+                                                        if stream.write_all(&resp_len).await.is_err() || stream.write_all(&resp_bytes).await.is_err() {
+                                                            return;
+                                                        }
+                                                        (true, chosen)
+                                                    } else {
+                                                        let fail_resp = ConnectionHandshakeResponse {
+                                                            accepted: false,
+                                                            access_level: AccessLevel::Standard,
+                                                            reason: Some("Incorrect password".to_string()),
+                                                            auth_challenge: None,
+                                                            auth_result: Some(AuthResult {
+                                                                success: false,
+                                                                profile: None,
+                                                                reason: Some("Incorrect password".to_string()),
+                                                            }),
+                                                        };
+                                                        let resp_bytes = serde_json::to_vec(&fail_resp).unwrap_or_default();
+                                                        let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+                                                        let _ = stream.write_all(&resp_len).await;
+                                                        let _ = stream.write_all(&resp_bytes).await;
+                                                        let _ = stream.shutdown().await;
+                                                        return;
+                                                    }
+                                                } else {
+                                                    let _ = stream.shutdown().await;
+                                                    return;
+                                                }
+                                            }
+                                            Err(_) => {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         } else {
                             // Unattended Access is disabled: Prompt host user
@@ -854,6 +976,9 @@ impl DirectLanClient {
         })??;
 
         let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+        if resp_len > 65535 {
+            return Err(NetError::ConnectionDeclined("Invalid response size".to_string()));
+        }
         let mut resp_buf = vec![0u8; resp_len];
         stream.read_exact(&mut resp_buf).await?;
         let resp: ConnectionHandshakeResponse = serde_json::from_slice(&resp_buf)?;
@@ -894,12 +1019,183 @@ impl DirectLanClient {
                 } else {
                     let reason = auth_result_resp
                         .reason
-                        .unwrap_or_else(|| "Incorrect Password".to_string());
+                        .unwrap_or_else(|| "Incorrect password".to_string());
                     return Err(NetError::IncorrectPassword(reason));
                 }
             } else {
                 // No password provided: prompt client UI
                 return Err(NetError::AuthRequired(challenge));
+            }
+        }
+
+        if !resp.accepted {
+            return Err(NetError::ConnectionDeclined(
+                resp.reason
+                    .unwrap_or_else(|| "Connection was declined by the remote host".to_string()),
+            ));
+        }
+
+        Ok((stream, resp.access_level))
+    }
+
+    pub async fn connect_video_stream_interactive<F, Fut>(
+        &self,
+        password: Option<String>,
+        on_auth_challenge: F,
+    ) -> Result<(TcpStream, AccessLevel), NetError>
+    where
+        F: FnOnce(AuthChallenge) -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
+        let video_addr = SocketAddr::new(self.target_addr.ip(), self.target_addr.port() + 1);
+        let mut stream = TcpStream::connect(video_addr).await?;
+        let _ = stream.set_nodelay(true);
+
+        // Send initial Handshake Request
+        let req = ConnectionHandshakeRequest {
+            client_peer_id: self.my_peer_id.clone(),
+            client_name: None,
+            auth_response: None,
+        };
+        let req_bytes = serde_json::to_vec(&req)?;
+        let req_len = (req_bytes.len() as u32).to_be_bytes();
+        stream.write_all(&req_len).await?;
+        stream.write_all(&req_bytes).await?;
+
+        // Read initial Handshake Response (wait up to 35s for Host user to accept or challenge)
+        let mut resp_len_buf = [0u8; 4];
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(35),
+            stream.read_exact(&mut resp_len_buf),
+        )
+        .await
+        .map_err(|_| {
+            NetError::ConnectionDeclined("Connection request timed out waiting for host response".to_string())
+        })??;
+
+        let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+        if resp_len > 65535 {
+            return Err(NetError::ConnectionDeclined("Invalid response size".to_string()));
+        }
+        let mut resp_buf = vec![0u8; resp_len];
+        stream.read_exact(&mut resp_buf).await?;
+        let resp: ConnectionHandshakeResponse = serde_json::from_slice(&resp_buf)?;
+
+        // If host sent an AuthChallenge:
+        if let Some(challenge) = resp.auth_challenge {
+            if let Some(pwd) = password {
+                // Compute salted hash and send follow-up AuthResponse immediately
+                let hash = app_common::hash_password(&pwd, &challenge.salt);
+                let auth_req = ConnectionHandshakeRequest {
+                    client_peer_id: self.my_peer_id.clone(),
+                    client_name: None,
+                    auth_response: Some(AuthResponse { hash }),
+                };
+                let auth_bytes = serde_json::to_vec(&auth_req)?;
+                let auth_len = (auth_bytes.len() as u32).to_be_bytes();
+                stream.write_all(&auth_len).await?;
+                stream.write_all(&auth_bytes).await?;
+
+                // Read verification response (AuthResult)
+                let mut auth_resp_len_buf = [0u8; 4];
+                tokio::time::timeout(
+                    tokio::time::Duration::from_secs(15),
+                    stream.read_exact(&mut auth_resp_len_buf),
+                )
+                .await
+                .map_err(|_| {
+                    NetError::ConnectionDeclined("Timed out waiting for authentication verification".to_string())
+                })??;
+
+                let auth_resp_len = u32::from_be_bytes(auth_resp_len_buf) as usize;
+                let mut auth_resp_buf = vec![0u8; auth_resp_len];
+                stream.read_exact(&mut auth_resp_buf).await?;
+                let auth_result_resp: ConnectionHandshakeResponse = serde_json::from_slice(&auth_resp_buf)?;
+
+                if auth_result_resp.accepted {
+                    return Ok((stream, auth_result_resp.access_level));
+                } else {
+                    let reason = auth_result_resp
+                        .reason
+                        .unwrap_or_else(|| "Incorrect password".to_string());
+                    return Err(NetError::IncorrectPassword(reason));
+                }
+            } else {
+                // Interactive flow: hold connection and prompt user modal concurrently with host unsolicited response
+                let challenge_salt = challenge.salt.clone();
+                let client_peer_id = self.my_peer_id.clone();
+
+                tokio::select! {
+                    user_pwd_opt = on_auth_challenge(challenge) => {
+                        if let Some(pwd) = user_pwd_opt {
+                            let hash = app_common::hash_password(&pwd, &challenge_salt);
+                            let auth_req = ConnectionHandshakeRequest {
+                                client_peer_id,
+                                client_name: None,
+                                auth_response: Some(AuthResponse { hash }),
+                            };
+                            let auth_bytes = serde_json::to_vec(&auth_req)?;
+                            let auth_len = (auth_bytes.len() as u32).to_be_bytes();
+                            stream.write_all(&auth_len).await?;
+                            stream.write_all(&auth_bytes).await?;
+
+                            let mut auth_resp_len_buf = [0u8; 4];
+                            tokio::time::timeout(
+                                tokio::time::Duration::from_secs(15),
+                                stream.read_exact(&mut auth_resp_len_buf),
+                            )
+                            .await
+                            .map_err(|_| {
+                                NetError::ConnectionDeclined("Timed out waiting for authentication verification".to_string())
+                            })??;
+
+                            let auth_resp_len = u32::from_be_bytes(auth_resp_len_buf) as usize;
+                            let mut auth_resp_buf = vec![0u8; auth_resp_len];
+                            stream.read_exact(&mut auth_resp_buf).await?;
+                            let auth_result_resp: ConnectionHandshakeResponse = serde_json::from_slice(&auth_resp_buf)?;
+
+                            if auth_result_resp.accepted {
+                                return Ok((stream, auth_result_resp.access_level));
+                            } else {
+                                let reason = auth_result_resp
+                                    .reason
+                                    .unwrap_or_else(|| "Incorrect password".to_string());
+                                return Err(NetError::IncorrectPassword(reason));
+                            }
+                        } else {
+                            let _ = stream.shutdown().await;
+                            return Err(NetError::ConnectionDeclined("Authorization cancelled by user".to_string()));
+                        }
+                    }
+
+                    host_unsolicited = async {
+                        let mut next_len_buf = [0u8; 4];
+                        stream.read_exact(&mut next_len_buf).await?;
+                        let next_len = u32::from_be_bytes(next_len_buf) as usize;
+                        if next_len > 65535 {
+                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Payload too large"));
+                        }
+                        let mut next_buf = vec![0u8; next_len];
+                        stream.read_exact(&mut next_buf).await?;
+                        serde_json::from_slice::<ConnectionHandshakeResponse>(&next_buf)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                    } => {
+                        match host_unsolicited {
+                            Ok(host_resp) => {
+                                if host_resp.accepted {
+                                    return Ok((stream, host_resp.access_level));
+                                } else {
+                                    return Err(NetError::ConnectionDeclined(
+                                        host_resp.reason.unwrap_or_else(|| "Connection declined by host".to_string())
+                                    ));
+                                }
+                            }
+                            Err(_) => {
+                                return Err(NetError::ConnectionDeclined("Connection closed by host".to_string()));
+                            }
+                        }
+                    }
+                }
             }
         }
 

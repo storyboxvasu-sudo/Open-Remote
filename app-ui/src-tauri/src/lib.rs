@@ -110,6 +110,7 @@ pub struct AppEngineState {
     pub app_handle: Arc<parking_lot::Mutex<Option<tauri::AppHandle>>>,
     pub pending_requests: Arc<parking_lot::Mutex<HashMap<String, oneshot::Sender<(bool, AccessLevel)>>>>,
     pub default_access_level: Arc<parking_lot::RwLock<AccessLevel>>,
+    pub pending_client_auth: Arc<parking_lot::Mutex<Option<oneshot::Sender<Option<String>>>>>,
 }
 
 impl AppEngineState {
@@ -134,6 +135,7 @@ impl AppEngineState {
             app_handle: Arc::new(parking_lot::Mutex::new(None)),
             pending_requests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             default_access_level: Arc::new(parking_lot::RwLock::new(AccessLevel::Standard)),
+            pending_client_auth: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -307,28 +309,77 @@ async fn connect_to_remote(
         .map_err(|e| format!("Failed to initialize connection to {}: {:?}", target_addr, e))?;
     let client_arc = Arc::new(client);
 
-    // Perform handshake and connect video stream (with password if provided)
+    // Hook interactive authentication handler for unattended password authorization
+    let app_handle_opt = Arc::clone(&state.app_handle);
+    let pending_auth_opt = Arc::clone(&state.pending_client_auth);
+    let target_display = target_addr.to_string();
+
     let connect_res = client_arc
-        .connect_video_stream_with_password(password)
+        .connect_video_stream_interactive(password, move |challenge| {
+            let app_handle_opt = Arc::clone(&app_handle_opt);
+            let pending_auth_opt = Arc::clone(&pending_auth_opt);
+            let target_str = target_display.clone();
+
+            async move {
+                let (auth_tx, auth_rx) = oneshot::channel();
+                *pending_auth_opt.lock() = Some(auth_tx);
+
+                if let Some(app) = app_handle_opt.lock().as_ref() {
+                    let _ = app.emit(
+                        "auth-required",
+                        serde_json::json!({
+                            "type": "auth_required",
+                            "authType": "password",
+                            "salt": challenge.salt,
+                            "target": target_str,
+                        }),
+                    );
+                }
+
+                match auth_rx.await {
+                    Ok(opt) => opt,
+                    Err(_) => None,
+                }
+            }
+        })
         .await;
 
     let (mut video_stream, initial_access_level) = match connect_res {
-        Ok(res) => res,
-        Err(core_net::NetError::AuthRequired(challenge)) => {
-            return Ok(ClientConnectResult {
-                success: false,
-                local_ws_port: 0,
-                target_ip: target_addr.to_string(),
-                message: "Authentication required".to_string(),
-                initial_access_level: AccessLevel::Standard,
-                requires_password: true,
-                challenge: Some(challenge.challenge),
-            });
+        Ok(res) => {
+            let _ = state.pending_client_auth.lock().take();
+            if let Some(app) = state.app_handle.lock().as_ref() {
+                let _ = app.emit("auth-success", serde_json::json!({ "type": "auth_success" }));
+            }
+            res
         }
         Err(core_net::NetError::IncorrectPassword(reason)) => {
+            let _ = state.pending_client_auth.lock().take();
+            if let Some(app) = state.app_handle.lock().as_ref() {
+                let _ = app.emit(
+                    "auth-failed",
+                    serde_json::json!({
+                        "type": "auth_failed",
+                        "reason": reason,
+                    }),
+                );
+            }
+            return Err(reason);
+        }
+        Err(core_net::NetError::ConnectionDeclined(reason)) => {
+            let _ = state.pending_client_auth.lock().take();
+            if let Some(app) = state.app_handle.lock().as_ref() {
+                let _ = app.emit(
+                    "auth-declined",
+                    serde_json::json!({
+                        "type": "auth_declined",
+                        "reason": reason,
+                    }),
+                );
+            }
             return Err(reason);
         }
         Err(e) => {
+            let _ = state.pending_client_auth.lock().take();
             return Err(format!("{}", e));
         }
     };
@@ -463,6 +514,29 @@ async fn respond_connection_request(
     } else {
         Err("Connection request has expired or was already handled".to_string())
     }
+}
+
+#[tauri::command]
+async fn submit_auth_password(
+    password: String,
+    state: State<'_, AppEngineState>,
+) -> Result<bool, String> {
+    if let Some(tx) = state.pending_client_auth.lock().take() {
+        let _ = tx.send(Some(password));
+        Ok(true)
+    } else {
+        Err("No pending authorization request".to_string())
+    }
+}
+
+#[tauri::command]
+async fn cancel_auth(
+    state: State<'_, AppEngineState>,
+) -> Result<bool, String> {
+    if let Some(tx) = state.pending_client_auth.lock().take() {
+        let _ = tx.send(None);
+    }
+    Ok(true)
 }
 
 #[tauri::command]
@@ -962,6 +1036,8 @@ pub fn run() {
             save_recent_session,
             remove_recent_session,
             respond_connection_request,
+            submit_auth_password,
+            cancel_auth,
             set_session_access_level,
             set_default_access_level,
             get_host_session_state,
