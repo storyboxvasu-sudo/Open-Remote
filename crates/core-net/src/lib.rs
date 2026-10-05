@@ -264,6 +264,60 @@ impl DirectLanHost {
         *self.prompt_callback.lock() = Some(Arc::new(callback));
     }
 
+    /// Injects an input event on the host, respecting hardware input priority and access levels
+    pub fn inject_input_event(&self, event: &InputEvent) {
+        Self::inject_input_internal(&self.injector, &self.capturer, &self.access_level, event);
+    }
+
+    fn inject_input_internal(
+        injector: &Arc<InputInjector>,
+        capturer: &Arc<ScreenCapturer>,
+        access_level: &Arc<parking_lot::RwLock<AccessLevel>>,
+        event: &InputEvent,
+    ) {
+        // Local Hardware Input Priority: check physical host input cooldown (1500ms)
+        let is_locked = core_input::is_host_input_active(1500);
+        if is_locked {
+            injector.release_all();
+            // Allow monitor switching even when input is locked
+            if let InputEvent::SwitchMonitor { monitor_index } = event {
+                let _ = capturer.switch_monitor(*monitor_index);
+                let monitors = ScreenCapturer::enumerate_monitors();
+                if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
+                    injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
+                }
+            }
+            return;
+        }
+
+        let current_level = *access_level.read();
+        match current_level {
+            AccessLevel::ViewOnly => {
+                if let InputEvent::SwitchMonitor { monitor_index } = event {
+                    let _ = capturer.switch_monitor(*monitor_index);
+                    let monitors = ScreenCapturer::enumerate_monitors();
+                    if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
+                        injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
+                    }
+                }
+            }
+            AccessLevel::Standard | AccessLevel::FullAccess => {
+                match event {
+                    InputEvent::SwitchMonitor { monitor_index } => {
+                        let _ = capturer.switch_monitor(*monitor_index);
+                        let monitors = ScreenCapturer::enumerate_monitors();
+                        if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
+                            injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
+                        }
+                    }
+                    _ => {
+                        let _ = injector.inject(event);
+                    }
+                }
+            }
+        }
+    }
+
     /// Starts the background listener for incoming control events over direct LAN UDP with socket reuse
     pub async fn start_input_listener(&self) -> Result<(), NetError> {
         core_input::ensure_host_input_monitor();
@@ -273,62 +327,15 @@ impl DirectLanHost {
         let socket = bind_udp_reuse(addr).await?;
         let injector = Arc::clone(&self.injector);
         let capturer = Arc::clone(&self.capturer);
-        let access_level_lock = Arc::clone(&self.access_level);
+        let access_level = Arc::clone(&self.access_level);
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
-            let mut was_locked = false;
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, _peer_addr)) => {
                         if let Ok(event) = serde_json::from_slice::<InputEvent>(&buf[..len]) {
-                            // Local Hardware Input Priority: check physical host input cooldown (1500ms)
-                            let is_locked = core_input::is_host_input_active(1500);
-                            if is_locked {
-                                if !was_locked {
-                                    was_locked = true;
-                                    injector.release_all();
-                                }
-                                // Allow monitor switching even when input is locked
-                                if let InputEvent::SwitchMonitor { monitor_index } = &event {
-                                    let _ = capturer.switch_monitor(*monitor_index);
-                                    let monitors = ScreenCapturer::enumerate_monitors();
-                                    if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
-                                        injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
-                                    }
-                                }
-                                continue;
-                            }
-                            was_locked = false;
-
-                            let current_level = *access_level_lock.read();
-                            match current_level {
-                                AccessLevel::ViewOnly => {
-                                    // In ViewOnly mode, discard all clicks, movements, keystrokes and scrolls.
-                                    // Allow monitor switching so remote viewer can inspect attached displays.
-                                    if let InputEvent::SwitchMonitor { monitor_index } = &event {
-                                        let _ = capturer.switch_monitor(*monitor_index);
-                                        let monitors = ScreenCapturer::enumerate_monitors();
-                                        if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
-                                            injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
-                                        }
-                                    }
-                                }
-                                AccessLevel::Standard | AccessLevel::FullAccess => {
-                                    match &event {
-                                        InputEvent::SwitchMonitor { monitor_index } => {
-                                            let _ = capturer.switch_monitor(*monitor_index);
-                                            let monitors = ScreenCapturer::enumerate_monitors();
-                                            if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
-                                                injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
-                                            }
-                                        }
-                                        _ => {
-                                            let _ = injector.inject(&event);
-                                        }
-                                    }
-                                }
-                            }
+                            Self::inject_input_internal(&injector, &capturer, &access_level, &event);
                         }
                     }
                     Err(_) => break,

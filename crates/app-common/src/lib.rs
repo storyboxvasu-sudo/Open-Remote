@@ -83,6 +83,8 @@ pub struct PeerConfig {
     pub recent_sessions: Vec<RecentSession>,
     #[serde(default)]
     pub unattended_access: UnattendedAccessConfig,
+    #[serde(default)]
+    pub signaling_server: Option<String>,
 }
 
 impl PeerConfig {
@@ -105,6 +107,7 @@ impl PeerConfig {
                 .as_secs(),
             recent_sessions: Vec::new(),
             unattended_access: UnattendedAccessConfig::default(),
+            signaling_server: None,
         }
     }
 
@@ -252,6 +255,7 @@ impl PeerId {
                 .as_secs(),
             recent_sessions: Vec::new(),
             unattended_access: UnattendedAccessConfig::default(),
+            signaling_server: None,
         };
 
         let dir = Self::config_dir();
@@ -409,11 +413,44 @@ pub struct FrameMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", content = "payload")]
 pub enum SignalingMessage {
-    Register { peer_id: String },
-    Registered { peer_id: String, success: bool },
-    Offer { target: String, sdp: String },
-    Answer { target: String, sdp: String },
-    Candidate { target: String, candidate: String },
+    Register {
+        peer_id: String,
+    },
+    Registered {
+        peer_id: String,
+        success: bool,
+        #[serde(default)]
+        active_peers: Option<usize>,
+    },
+    Lookup {
+        target: String,
+    },
+    LookupResult {
+        target: String,
+        online: bool,
+    },
+    Offer {
+        target: String,
+        sdp: String,
+        #[serde(default)]
+        from: Option<String>,
+    },
+    Answer {
+        target: String,
+        sdp: String,
+        #[serde(default)]
+        from: Option<String>,
+    },
+    Candidate {
+        target: String,
+        candidate: serde_json::Value,
+        #[serde(default)]
+        from: Option<String>,
+    },
+    PeerNotFound {
+        target: String,
+        reason: String,
+    },
     Ping,
     Pong,
 }

@@ -26,6 +26,10 @@ pub struct SystemInfo {
     pub default_video_port: u16,
     pub is_hosting: bool,
     pub is_connected: bool,
+    #[serde(default)]
+    pub host_feed_port: Option<u16>,
+    #[serde(default)]
+    pub signaling_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,6 +38,7 @@ pub struct HostStatus {
     pub peer_id: String,
     pub control_port: u16,
     pub video_port: u16,
+    pub host_feed_port: u16,
     pub message: String,
 }
 
@@ -64,6 +69,7 @@ pub struct ActiveHost {
     pub stop_flag: Arc<AtomicBool>,
     pub control_port: u16,
     pub video_port: u16,
+    pub host_feed_port: u16,
 }
 
 impl ActiveHost {
@@ -148,16 +154,18 @@ async fn internal_start_hosting(
     state: &AppEngineState,
     port: u16,
 ) -> Result<HostStatus, String> {
-    let mut host_guard = state.host.lock().await;
-    if host_guard.is_some() {
+    let host_guard_check = state.host.lock().await;
+    if let Some(ref h) = *host_guard_check {
         return Ok(HostStatus {
             success: true,
             peer_id: state.peer_id.clone(),
             control_port: port,
             video_port: port + 1,
+            host_feed_port: h.host_feed_port,
             message: "Host is already running".to_string(),
         });
     }
+    drop(host_guard_check);
 
     let capturer = Arc::clone(&state.capturer);
     let host_net = Arc::new(DirectLanHost::with_peer_id(port, state.peer_id.clone(), Arc::clone(&capturer)));
@@ -219,8 +227,78 @@ async fn internal_start_hosting(
     let _ = host_net.start_discovery_responder().await;
     let _ = core_net::start_background_client_discovery().await;
 
-    let stop_flag = Arc::new(AtomicBool::new(false));
+    // Loopback WebSocket feed for Host WebRTC video stream
+    let host_ws_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("Failed to bind host loopback feed: {}", e))?;
+    let host_feed_port = host_ws_listener
+        .local_addr()
+        .map_err(|e| format!("Failed to get host feed port: {}", e))?
+        .port();
 
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_ws = Arc::clone(&stop_flag);
+    let capturer_ws = Arc::clone(&state.capturer);
+    let def_level_ws = Arc::clone(&state.default_access_level);
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = host_ws_listener.accept().await {
+            let _ = stream.set_nodelay(true);
+            if let Ok(mut ws_stream) = accept_async(stream).await {
+                let enc = FrameEncoder::new();
+                let mut last_seq = 0u64;
+                let mut last_send_time = tokio::time::Instant::now();
+                let mut last_locked_state: Option<bool> = None;
+
+                while !stop_flag_ws.load(Ordering::Relaxed) {
+                    let current_seq = capturer_ws.frame_counter();
+                    let is_locked = core_input::is_host_input_active(1500);
+                    let lock_changed = last_locked_state != Some(is_locked);
+                    if lock_changed {
+                        last_locked_state = Some(is_locked);
+                    }
+
+                    let should_send = (current_seq != last_seq)
+                        || (last_seq == 0)
+                        || lock_changed
+                        || (last_send_time.elapsed().as_millis() >= 500);
+
+                    if should_send {
+                        if let Some(frame) = capturer_ws.get_latest_frame() {
+                            if let Ok(Some(compressed)) = enc.encode(&frame) {
+                                if let Ok(raw_pixels) = enc.decode(&compressed.payload) {
+                                    let mut meta = compressed.meta;
+                                    meta.access_level = Some(*def_level_ws.read());
+                                    meta.host_input_active = Some(is_locked);
+
+                                    let mut buffer = Vec::with_capacity(36 + raw_pixels.len());
+                                    buffer.extend_from_slice(&meta.width.to_be_bytes());
+                                    buffer.extend_from_slice(&meta.height.to_be_bytes());
+                                    buffer.extend_from_slice(&meta.timestamp_ms.to_be_bytes());
+                                    buffer.extend_from_slice(&meta.dirty_x.to_be_bytes());
+                                    buffer.extend_from_slice(&meta.dirty_y.to_be_bytes());
+                                    buffer.extend_from_slice(&meta.dirty_w.to_be_bytes());
+                                    buffer.extend_from_slice(&meta.dirty_h.to_be_bytes());
+                                    buffer.push(if meta.is_keyframe { 1 } else { 0 });
+                                    buffer.extend_from_slice(&[0u8; 3]);
+                                    buffer.extend_from_slice(&raw_pixels);
+
+                                    if ws_stream.send(Message::Binary(buffer.into())).await.is_err() {
+                                        break;
+                                    }
+                                    last_seq = current_seq;
+                                    last_send_time = tokio::time::Instant::now();
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(16)).await;
+                }
+            }
+        }
+    });
+
+    let mut host_guard = state.host.lock().await;
     *host_guard = Some(ActiveHost {
         peer_id: state.peer_id.clone(),
         capturer,
@@ -228,6 +306,7 @@ async fn internal_start_hosting(
         stop_flag,
         control_port: port,
         video_port: port + 1,
+        host_feed_port,
     });
 
     Ok(HostStatus {
@@ -235,6 +314,7 @@ async fn internal_start_hosting(
         peer_id: state.peer_id.clone(),
         control_port: port,
         video_port: port + 1,
+        host_feed_port,
         message: format!("Host active on UDP:{} and TCP:{}", port, port + 1),
     })
 }
@@ -246,8 +326,14 @@ async fn get_system_info(state: State<'_, AppEngineState>) -> Result<SystemInfo,
         Err(_) => "127.0.0.1".to_string(),
     };
 
-    let is_hosting = state.host.lock().await.is_some();
+    let host_guard = state.host.lock().await;
+    let is_hosting = host_guard.is_some();
+    let host_feed_port = host_guard.as_ref().map(|h| h.host_feed_port);
     let is_connected = state.client.lock().await.is_some();
+    drop(host_guard);
+
+    let cfg = PeerConfig::load();
+    let signaling_url = Some(cfg.signaling_server.unwrap_or_else(|| "wss://signaling.openremote.app".to_string()));
 
     Ok(SystemInfo {
         peer_id: state.peer_id.clone(),
@@ -256,6 +342,8 @@ async fn get_system_info(state: State<'_, AppEngineState>) -> Result<SystemInfo,
         default_video_port: 44322,
         is_hosting,
         is_connected,
+        host_feed_port,
+        signaling_url,
     })
 }
 
@@ -639,6 +727,100 @@ async fn send_input(event: InputEvent, state: State<'_, AppEngineState>) -> Resu
             .map_err(|e| format!("Failed to send input: {:?}", e))?;
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn inject_host_input(event: InputEvent, state: State<'_, AppEngineState>) -> Result<(), String> {
+    let host_guard = state.host.lock().await;
+    if let Some(ref host) = *host_guard {
+        host.host_net.inject_input_event(&event);
+    } else {
+        let injector = core_input::InputInjector::new();
+        let _ = injector.inject(&event);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebRtcAuthCheckResult {
+    pub authorized: bool,
+    pub requires_password: bool,
+    pub access_level: AccessLevel,
+    pub reason: Option<String>,
+}
+
+#[tauri::command]
+async fn verify_webrtc_auth(
+    password_hash: Option<String>,
+    state: State<'_, AppEngineState>,
+) -> Result<WebRtcAuthCheckResult, String> {
+    let cfg = PeerConfig::load();
+    let u_cfg = cfg.unattended_access;
+
+    if u_cfg.enabled && u_cfg.password_hash.is_some() {
+        let expected = u_cfg.password_hash.unwrap_or_default();
+        if let Some(provided) = password_hash {
+            if provided.eq_ignore_ascii_case(&expected) {
+                return Ok(WebRtcAuthCheckResult {
+                    authorized: true,
+                    requires_password: false,
+                    access_level: u_cfg.profile,
+                    reason: None,
+                });
+            } else {
+                return Ok(WebRtcAuthCheckResult {
+                    authorized: false,
+                    requires_password: true,
+                    access_level: AccessLevel::Standard,
+                    reason: Some("Incorrect password".to_string()),
+                });
+            }
+        } else {
+            return Ok(WebRtcAuthCheckResult {
+                authorized: false,
+                requires_password: true,
+                access_level: AccessLevel::Standard,
+                reason: None,
+            });
+        }
+    }
+
+    let default_level = *state.default_access_level.read();
+    Ok(WebRtcAuthCheckResult {
+        authorized: true,
+        requires_password: false,
+        access_level: default_level,
+        reason: None,
+    })
+}
+
+#[tauri::command]
+fn get_signaling_url() -> String {
+    let cfg = PeerConfig::load();
+    cfg.signaling_server.unwrap_or_else(|| "wss://signaling.openremote.app".to_string())
+}
+
+#[tauri::command]
+fn set_signaling_url(url: String) -> Result<String, String> {
+    let mut cfg = PeerConfig::load();
+    let trimmed = url.trim().to_string();
+    if trimmed.is_empty() || trimmed == "wss://signaling.openremote.app" {
+        cfg.signaling_server = None;
+    } else {
+        cfg.signaling_server = Some(trimmed);
+    }
+    cfg.save().map_err(|e| format!("Failed to save config: {}", e))?;
+    Ok(cfg.signaling_server.unwrap_or_else(|| "wss://signaling.openremote.app".to_string()))
+}
+
+#[tauri::command]
+async fn get_host_feed_port(state: State<'_, AppEngineState>) -> Result<u16, String> {
+    let host_guard = state.host.lock().await;
+    if let Some(ref host) = *host_guard {
+        Ok(host.host_feed_port)
+    } else {
+        Err("Host is not currently active".to_string())
+    }
 }
 
 #[tauri::command]
@@ -1043,6 +1225,11 @@ pub fn run() {
             connect_to_remote,
             disconnect_remote,
             send_input,
+            inject_host_input,
+            verify_webrtc_auth,
+            get_signaling_url,
+            set_signaling_url,
+            get_host_feed_port,
             get_available_monitors,
             switch_monitor,
             switch_remote_monitor,

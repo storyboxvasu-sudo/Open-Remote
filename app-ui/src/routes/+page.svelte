@@ -5,6 +5,7 @@
   import { check, type Update } from "@tauri-apps/plugin-updater";
   import { getVersion } from "@tauri-apps/api/app";
   import { relaunch } from "@tauri-apps/plugin-process";
+  import { SignalingClient, WebRTCSession, type SignalingStatus } from "$lib/webrtc";
 
   type AccessLevel = "ViewOnly" | "Standard" | "FullAccess";
 
@@ -29,6 +30,8 @@
     default_video_port: number;
     is_hosting: boolean;
     is_connected: boolean;
+    host_feed_port?: number;
+    signaling_url?: string;
   }
 
   interface HostStatus {
@@ -81,6 +84,15 @@
   let isConnected = $state(false);
   let connectionError = $state("");
   let copied = $state(false);
+
+  // Public Internet Signaling & WebRTC NAT Traversal State
+  let signalingUrl = $state("wss://signaling.openremote.app");
+  let signalingUrlInput = $state("wss://signaling.openremote.app");
+  let signalingStatus = $state<SignalingStatus>("connecting");
+  let signalingStatusDetails = $state("");
+  let isSavingSignaling = $state(false);
+  let signalingClient: SignalingClient | null = null;
+  let webrtcSession: WebRTCSession | null = null;
 
   // Multi-Monitor state (Host local vs Remote)
   let availableMonitors = $state<MonitorDescriptor[]>([]);
@@ -439,6 +451,95 @@
     }
   }
 
+  function updateNetworkStatusBadge() {
+    if (isConnecting) {
+      hostStatusMessage = "Connecting to peer over WAN...";
+    } else if (signalingStatus === "online") {
+      hostStatusMessage = "Online (Cloud Ready)";
+    } else if (signalingStatus === "connecting") {
+      hostStatusMessage = "Connecting to signaling server...";
+    } else {
+      hostStatusMessage = isHosting ? "Ready for incoming connections (LAN)" : "LAN Direct Mode (Cloud Offline)";
+    }
+  }
+
+  function initSignalingClient() {
+    if (!systemInfo?.peer_id) return;
+    if (signalingClient) {
+      signalingClient.stop();
+    }
+
+    signalingClient = new SignalingClient(signalingUrl);
+    signalingClient.onStatusChange = (status, details) => {
+      signalingStatus = status;
+      signalingStatusDetails = details || "";
+      updateNetworkStatusBadge();
+    };
+
+    signalingClient.onOffer = async (fromPeerId, sdp) => {
+      console.log(`[signaling] Incoming WebRTC offer from ${fromPeerId}`);
+      await handleIncomingWebRtcOffer(fromPeerId, sdp);
+    };
+
+    signalingClient.onAnswer = async (fromPeerId, sdp) => {
+      console.log(`[signaling] Incoming WebRTC answer from ${fromPeerId}`);
+      if (webrtcSession) {
+        await webrtcSession.handleAnswer(sdp);
+      }
+    };
+
+    signalingClient.onCandidate = async (fromPeerId, candidate) => {
+      if (webrtcSession) {
+        await webrtcSession.addIceCandidate(candidate);
+      }
+    };
+
+    signalingClient.onPeerNotFound = (target, reason) => {
+      console.log(`[signaling] Target ${target} not found: ${reason}`);
+      isConnecting = false;
+      connectionError = reason || "Partner ID is offline or not registered.";
+      updateNetworkStatusBadge();
+    };
+
+    signalingClient.start(systemInfo.peer_id);
+  }
+
+  async function handleIncomingWebRtcOffer(fromPeerId: string, sdp: string) {
+    try {
+      const feedPort: number = (systemInfo?.host_feed_port) || (await invoke("get_host_feed_port"));
+      if (webrtcSession) {
+        webrtcSession.close();
+      }
+      webrtcSession = new WebRTCSession(signalingClient!, systemInfo?.peer_id || "");
+      webrtcSession.onControlMessage = (msg) => {
+        console.log("[webrtc host] Received control msg:", msg);
+      };
+      await webrtcSession.handleIncomingOffer(fromPeerId, sdp, feedPort);
+      console.log(`[webrtc host] Call answered for ${fromPeerId}`);
+    } catch (err) {
+      console.error("[webrtc host] Error answering incoming offer:", err);
+    }
+  }
+
+  async function saveSignalingUrl() {
+    if (!signalingUrlInput.trim() || isSavingSignaling) return;
+    isSavingSignaling = true;
+    try {
+      const saved: string = await invoke("set_signaling_url", { url: signalingUrlInput.trim() });
+      signalingUrl = saved;
+      signalingUrlInput = saved;
+      if (signalingClient) {
+        signalingClient.setUrl(saved);
+      } else {
+        initSignalingClient();
+      }
+    } catch (err) {
+      console.error("Failed to save signaling url:", err);
+    } finally {
+      isSavingSignaling = false;
+    }
+  }
+
   async function loadSystemInfo() {
     try {
       const info: SystemInfo = await invoke("get_system_info");
@@ -446,14 +547,20 @@
       isHosting = info.is_hosting;
       isConnected = info.is_connected;
 
+      if (info.signaling_url) {
+        signalingUrl = info.signaling_url;
+        signalingUrlInput = info.signaling_url;
+      }
+
       if (!isHosting) {
         startHostingAuto();
-      } else {
-        hostStatusMessage = "Ready for incoming connections";
       }
+
+      initSignalingClient();
+      updateNetworkStatusBadge();
     } catch (err) {
       console.error("Failed to fetch system info:", err);
-      hostStatusMessage = "Ready for incoming connections";
+      updateNetworkStatusBadge();
     }
   }
 
@@ -547,7 +654,9 @@
 
   async function connectToRemote(passwordToUse?: string) {
     if (!targetAddress.trim() || isConnecting) return;
-    const cleanTargetId = targetAddress.trim().replace(/-/g, "");
+    const rawTarget = targetAddress.trim();
+    const cleanTargetId = rawTarget.replace(/-/g, "");
+    const isNineDigitId = /^\d{9}$/.test(cleanTargetId);
 
     // Check saved credentials if no explicit password passed
     if (!passwordToUse) {
@@ -560,11 +669,64 @@
     isConnecting = true;
     connectionError = "";
     authModalError = "";
-    pendingAuthTarget = targetAddress.trim();
+    pendingAuthTarget = rawTarget;
 
+    // WAN dialing over Google STUN WebRTC if 9-digit peer ID and signaling is online
+    if (isNineDigitId && signalingClient && signalingStatus === "online") {
+      hostStatusMessage = "Connecting to peer over WAN...";
+      try {
+        if (webrtcSession) {
+          webrtcSession.close();
+        }
+        webrtcSession = new WebRTCSession(signalingClient, systemInfo?.peer_id || "");
+        webrtcSession.onFrameData = (buffer) => {
+          handleStreamMessage(buffer);
+        };
+        webrtcSession.onControlMessage = (msg) => {
+          handleStreamMessage(JSON.stringify(msg));
+        };
+        webrtcSession.onConnected = () => {
+          console.log("[webrtc] Connected to peer over WAN");
+          isConnected = true;
+          isConnecting = false;
+          loadRecentSessions();
+          invoke("save_recent_session", { peerId: rawTarget, alias: null }).catch(() => {});
+          updateNetworkStatusBadge();
+        };
+        webrtcSession.onDisconnected = () => {
+          console.log("[webrtc] Session disconnected");
+          disconnectRemote();
+        };
+        webrtcSession.onError = (err) => {
+          console.warn("[webrtc] Error:", err);
+          connectionError = typeof err === "string" ? err : (err?.message || "WebRTC connection error");
+          isConnecting = false;
+          updateNetworkStatusBadge();
+        };
+
+        await webrtcSession.call(rawTarget);
+
+        // 12-second timeout for WAN signaling
+        setTimeout(() => {
+          if (isConnecting && !isConnected) {
+            if (!connectionError) {
+              connectionError = "Connection timed out. Partner ID is offline or not registered.";
+            }
+            isConnecting = false;
+            updateNetworkStatusBadge();
+          }
+        }, 12000);
+
+        return;
+      } catch (wanErr: any) {
+        console.warn("[webrtc] WAN attempt failed, falling back to direct network:", wanErr);
+      }
+    }
+
+    // Direct LAN connection fallback
     try {
       const res: ClientConnectResult = await invoke("connect_to_remote", {
-        targetAddress: targetAddress.trim(),
+        targetAddress: rawTarget,
         port: 44321,
         password: passwordToUse || null,
       });
@@ -612,6 +774,7 @@
       isConnecting = false;
       isConnected = false;
       isSubmittingAuth = false;
+      updateNetworkStatusBadge();
     }
   }
 
@@ -650,6 +813,10 @@
   }
 
   async function disconnectRemote() {
+    if (webrtcSession) {
+      webrtcSession.close();
+      webrtcSession = null;
+    }
     if (ws) {
       ws.close();
       ws = null;
@@ -660,6 +827,7 @@
       console.error("Disconnect error:", err);
     }
     isConnected = false;
+    isConnecting = false;
     remoteResolution = { width: 0, height: 0 };
     fps = 0;
     remoteDisplays = [];
@@ -672,6 +840,78 @@
       if (ctx) ctx.clearRect(0, 0, canvasRef.width, canvasRef.height);
     }
     backCanvas = null;
+    updateNetworkStatusBadge();
+  }
+
+  function handleStreamMessage(data: string | ArrayBuffer) {
+    // 1. Dynamic Display Manifest & Permission updates from Remote Host
+    if (typeof data === "string") {
+      try {
+        const msg = JSON.parse(data);
+        if (msg.type === "display_manifest" && Array.isArray(msg.displays)) {
+          remoteDisplays = msg.displays;
+          activeRemoteDisplayId = msg.active_display_id || 1;
+        } else if (msg.type === "permission_update" && msg.access_level) {
+          clientAccessLevel = msg.access_level;
+          console.log("Remote permission level updated to:", clientAccessLevel);
+        } else if (msg.type === "host_input_active") {
+          isHostInputLocked = !!msg.locked;
+          console.log("Host input lock state:", isHostInputLocked);
+        }
+      } catch (e) {
+        console.error("Stream json parse error:", e);
+      }
+      return;
+    }
+
+    if (!(data instanceof ArrayBuffer)) return;
+    frameCount++;
+
+    const buffer = data;
+    if (buffer.byteLength < 36) return;
+
+    const view = new DataView(buffer);
+    const width = view.getUint32(0);
+    const height = view.getUint32(4);
+    const timestampMs = Number(view.getBigUint64(8));
+    const dirtyX = view.getUint32(16);
+    const dirtyY = view.getUint32(20);
+    const dirtyW = view.getUint32(24);
+    const dirtyH = view.getUint32(28);
+
+    const now = Date.now();
+    if (timestampMs > 0 && now >= timestampMs) {
+      rttMs = now - timestampMs;
+    }
+
+    remoteResolution = { width, height };
+
+    if (dirtyW === 0 || dirtyH === 0) return;
+
+    // Offscreen canvas back-buffer to assemble dirty rects before VSync render
+    if (!backCanvas) {
+      backCanvas = document.createElement("canvas");
+    }
+    if (backCanvas.width !== width || backCanvas.height !== height) {
+      backCanvas.width = width;
+      backCanvas.height = height;
+    }
+
+    const backCtx = backCanvas.getContext("2d", { alpha: false });
+    if (!backCtx) return;
+
+    const pixelBytes = new Uint8ClampedArray(buffer, 36);
+    if (pixelBytes.length !== dirtyW * dirtyH * 4) {
+      return;
+    }
+
+    try {
+      const dirtyImageData = new ImageData(pixelBytes, dirtyW, dirtyH);
+      backCtx.putImageData(dirtyImageData, dirtyX, dirtyY);
+      dirtyFramePending = true;
+    } catch (e) {
+      console.error("Frame dirty rect blit error:", e);
+    }
   }
 
   function initStreamWebSocket(port: number) {
@@ -687,74 +927,7 @@
     };
 
     socket.onmessage = (event: MessageEvent) => {
-      // 1. Dynamic Display Manifest & Permission updates from Remote Host
-      if (typeof event.data === "string") {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "display_manifest" && Array.isArray(msg.displays)) {
-            remoteDisplays = msg.displays;
-            activeRemoteDisplayId = msg.active_display_id || 1;
-          } else if (msg.type === "permission_update" && msg.access_level) {
-            clientAccessLevel = msg.access_level;
-            console.log("Remote permission level updated to:", clientAccessLevel);
-          } else if (msg.type === "host_input_active") {
-            isHostInputLocked = !!msg.locked;
-            console.log("Host input lock state:", isHostInputLocked);
-          }
-        } catch (e) {
-          console.error("Stream json parse error:", e);
-        }
-        return;
-      }
-
-      if (!(event.data instanceof ArrayBuffer)) return;
-      frameCount++;
-
-      const buffer = event.data;
-      if (buffer.byteLength < 36) return;
-
-      const view = new DataView(buffer);
-      const width = view.getUint32(0);
-      const height = view.getUint32(4);
-      const timestampMs = Number(view.getBigUint64(8));
-      const dirtyX = view.getUint32(16);
-      const dirtyY = view.getUint32(20);
-      const dirtyW = view.getUint32(24);
-      const dirtyH = view.getUint32(28);
-
-      const now = Date.now();
-      if (timestampMs > 0 && now >= timestampMs) {
-        rttMs = now - timestampMs;
-      }
-
-      remoteResolution = { width, height };
-
-      if (dirtyW === 0 || dirtyH === 0) return;
-
-      // Offscreen canvas back-buffer to assemble dirty rects before VSync render
-      if (!backCanvas) {
-        backCanvas = document.createElement("canvas");
-      }
-      if (backCanvas.width !== width || backCanvas.height !== height) {
-        backCanvas.width = width;
-        backCanvas.height = height;
-      }
-
-      const backCtx = backCanvas.getContext("2d", { alpha: false });
-      if (!backCtx) return;
-
-      const pixelBytes = new Uint8ClampedArray(buffer, 36);
-      if (pixelBytes.length !== dirtyW * dirtyH * 4) {
-        return;
-      }
-
-      try {
-        const dirtyImageData = new ImageData(pixelBytes, dirtyW, dirtyH);
-        backCtx.putImageData(dirtyImageData, dirtyX, dirtyY);
-        dirtyFramePending = true;
-      } catch (e) {
-        console.error("Frame dirty rect blit error:", e);
-      }
+      handleStreamMessage(event.data);
     };
 
     socket.onerror = (err) => {
@@ -769,6 +942,15 @@
     };
 
     ws = socket;
+  }
+
+  async function sendRemoteInput(event: any) {
+    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (webrtcSession && webrtcSession.isConnected()) {
+      webrtcSession.sendInput(event);
+      return;
+    }
+    await invoke("send_input", { event });
   }
 
   function getNormalizedCoordinates(e: MouseEvent): { x: number; y: number } {
@@ -808,18 +990,14 @@
       holdTimer = setTimeout(async () => {
         isHoldTriggered = true;
         const { x, y } = getTouchNormalizedCoordinates(t);
-        await invoke("send_input", {
-          event: {
-            type: "MouseDown",
-            data: { button: "Right", x, y },
-          },
+        await sendRemoteInput({
+          type: "MouseDown",
+          data: { button: "Right", x, y },
         });
         setTimeout(async () => {
-          await invoke("send_input", {
-            event: {
-              type: "MouseUp",
-              data: { button: "Right", x, y },
-            },
+          await sendRemoteInput({
+            type: "MouseUp",
+            data: { button: "Right", x, y },
           });
         }, 30);
         if (typeof navigator !== "undefined" && navigator.vibrate) {
@@ -864,11 +1042,9 @@
         if (now - lastMoveTime > 16) {
           lastMoveTime = now;
           const { x, y } = getTouchNormalizedCoordinates(t);
-          await invoke("send_input", {
-            event: {
-              type: "MouseMove",
-              data: { x, y },
-            },
+          await sendRemoteInput({
+            type: "MouseMove",
+            data: { x, y },
           });
         }
       }
@@ -926,24 +1102,18 @@
 
       if (duration < 350 && moveDist < 15) {
         const { x, y } = getTouchNormalizedCoordinates(t);
-        await invoke("send_input", {
-          event: {
-            type: "MouseMove",
-            data: { x, y },
-          },
+        await sendRemoteInput({
+          type: "MouseMove",
+          data: { x, y },
         });
-        await invoke("send_input", {
-          event: {
-            type: "MouseDown",
-            data: { button: "Left", x, y },
-          },
+        await sendRemoteInput({
+          type: "MouseDown",
+          data: { button: "Left", x, y },
         });
         setTimeout(async () => {
-          await invoke("send_input", {
-            event: {
-              type: "MouseUp",
-              data: { button: "Left", x, y },
-            },
+          await sendRemoteInput({
+            type: "MouseUp",
+            data: { button: "Left", x, y },
           });
         }, 25);
       }
@@ -953,18 +1123,14 @@
       if (duration < 350) {
         const t = e.changedTouches[0];
         const { x, y } = getTouchNormalizedCoordinates(t);
-        await invoke("send_input", {
-          event: {
-            type: "MouseDown",
-            data: { button: "Right", x, y },
-          },
+        await sendRemoteInput({
+          type: "MouseDown",
+          data: { button: "Right", x, y },
         });
         setTimeout(async () => {
-          await invoke("send_input", {
-            event: {
-              type: "MouseUp",
-              data: { button: "Right", x, y },
-            },
+          await sendRemoteInput({
+            type: "MouseUp",
+            data: { button: "Right", x, y },
           });
         }, 25);
       }
@@ -992,19 +1158,11 @@
   async function handleVirtualKeyDown(e: KeyboardEvent) {
     if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
     if (e.key === "Backspace") {
-      await invoke("send_input", {
-        event: { type: "KeyDown", data: { scancode: 8, key: "Backspace" } }
-      });
-      setTimeout(() => invoke("send_input", {
-        event: { type: "KeyUp", data: { scancode: 8, key: "Backspace" } }
-      }), 25);
+      await sendRemoteInput({ type: "KeyDown", data: { scancode: 8, key: "Backspace" } });
+      setTimeout(() => sendRemoteInput({ type: "KeyUp", data: { scancode: 8, key: "Backspace" } }), 25);
     } else if (e.key === "Enter") {
-      await invoke("send_input", {
-        event: { type: "KeyDown", data: { scancode: 13, key: "Enter" } }
-      });
-      setTimeout(() => invoke("send_input", {
-        event: { type: "KeyUp", data: { scancode: 13, key: "Enter" } }
-      }), 25);
+      await sendRemoteInput({ type: "KeyDown", data: { scancode: 13, key: "Enter" } });
+      setTimeout(() => sendRemoteInput({ type: "KeyUp", data: { scancode: 13, key: "Enter" } }), 25);
     }
   }
 
@@ -1014,12 +1172,8 @@
     const val = input.value;
     if (!val) return;
     for (const ch of val) {
-      await invoke("send_input", {
-        event: { type: "KeyDown", data: { scancode: ch.charCodeAt(0), key: ch } }
-      });
-      setTimeout(() => invoke("send_input", {
-        event: { type: "KeyUp", data: { scancode: ch.charCodeAt(0), key: ch } }
-      }), 25);
+      await sendRemoteInput({ type: "KeyDown", data: { scancode: ch.charCodeAt(0), key: ch } });
+      setTimeout(() => sendRemoteInput({ type: "KeyUp", data: { scancode: ch.charCodeAt(0), key: ch } }), 25);
     }
     input.value = "";
   }
@@ -1032,11 +1186,9 @@
     lastMoveTime = now;
 
     const { x, y } = getNormalizedCoordinates(e);
-    await invoke("send_input", {
-      event: {
-        type: "MouseMove",
-        data: { x, y },
-      },
+    await sendRemoteInput({
+      type: "MouseMove",
+      data: { x, y },
     });
   }
 
@@ -1046,11 +1198,9 @@
     const { x, y } = getNormalizedCoordinates(e);
     const button = e.button === 0 ? "Left" : e.button === 1 ? "Middle" : "Right";
 
-    await invoke("send_input", {
-      event: {
-        type: "MouseDown",
-        data: { button, x, y },
-      },
+    await sendRemoteInput({
+      type: "MouseDown",
+      data: { button, x, y },
     });
   }
 
@@ -1060,24 +1210,20 @@
     const { x, y } = getNormalizedCoordinates(e);
     const button = e.button === 0 ? "Left" : e.button === 1 ? "Middle" : "Right";
 
-    await invoke("send_input", {
-      event: {
-        type: "MouseUp",
-        data: { button, x, y },
-      },
+    await sendRemoteInput({
+      type: "MouseUp",
+      data: { button, x, y },
     });
   }
 
   async function handleWheel(e: WheelEvent) {
     if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
     e.preventDefault();
-    await invoke("send_input", {
-      event: {
-        type: "MouseWheel",
-        data: {
-          delta_x: Math.round(e.deltaX),
-          delta_y: Math.round(e.deltaY),
-        },
+    await sendRemoteInput({
+      type: "MouseWheel",
+      data: {
+        delta_x: Math.round(e.deltaX),
+        delta_y: Math.round(e.deltaY),
       },
     });
   }
@@ -1088,13 +1234,11 @@
     if (tag === "input" || tag === "textarea") return;
 
     e.preventDefault();
-    await invoke("send_input", {
-      event: {
-        type: "KeyDown",
-        data: {
-          scancode: e.keyCode,
-          key: e.key,
-        },
+    await sendRemoteInput({
+      type: "KeyDown",
+      data: {
+        scancode: e.keyCode,
+        key: e.key,
       },
     });
   }
@@ -1105,13 +1249,11 @@
     if (tag === "input" || tag === "textarea") return;
 
     e.preventDefault();
-    await invoke("send_input", {
-      event: {
-        type: "KeyUp",
-        data: {
-          scancode: e.keyCode,
-          key: e.key,
-        },
+    await sendRemoteInput({
+      type: "KeyUp",
+      data: {
+        scancode: e.keyCode,
+        key: e.key,
       },
     });
   }
@@ -1301,6 +1443,14 @@
     if (animFrameId) cancelAnimationFrame(animFrameId);
     if (fpsInterval) clearInterval(fpsInterval);
     if (ws) ws.close();
+    if (signalingClient) {
+      signalingClient.stop();
+      signalingClient = null;
+    }
+    if (webrtcSession) {
+      webrtcSession.close();
+      webrtcSession = null;
+    }
     if (unlistenAuthRequired) unlistenAuthRequired();
     if (unlistenAuthSuccess) unlistenAuthSuccess();
     if (unlistenAuthFailed) unlistenAuthFailed();
@@ -1695,8 +1845,20 @@
 
               <!-- Listening Status Dot -->
               <div class="status-indicator-row">
-                <span class="status-dot" class:active={isHosting}></span>
+                <span
+                  class="status-dot"
+                  class:active={signalingStatus === "online" || (signalingStatus === "offline" && isHosting)}
+                  class:connecting={signalingStatus === "connecting" || isConnecting}
+                  class:warning={signalingStatus === "error"}
+                ></span>
                 <span class="status-text">{hostStatusMessage}</span>
+                {#if signalingStatus === "online"}
+                  <span class="cloud-badge" title="Public STUN WebRTC relay active">WAN / Cloud</span>
+                {:else if signalingStatus === "connecting"}
+                  <span class="cloud-badge connecting" title="Connecting to signaling server">Connecting...</span>
+                {:else}
+                  <span class="cloud-badge lan" title="Operating in direct LAN mode">LAN Direct</span>
+                {/if}
               </div>
 
               <div class="desk-footer">
@@ -2064,6 +2226,76 @@
                 {/if}
               </div>
             </div>
+
+            <!-- Public Cloud Signaling & NAT Traversal Card -->
+            <div class="engine-section-card">
+              <div class="card-caption">
+                <span class="section-label">PUBLIC CLOUD SIGNALING</span>
+                <h2 class="card-heading">Internet Rendezvous & NAT Traversal</h2>
+              </div>
+              <div class="signaling-card-content">
+                <div
+                  class="signaling-status-banner"
+                  class:online={signalingStatus === "online"}
+                  class:connecting={signalingStatus === "connecting"}
+                  class:error={signalingStatus === "error" || signalingStatus === "offline"}
+                >
+                  <span
+                    class="status-dot"
+                    class:active={signalingStatus === "online"}
+                    class:connecting={signalingStatus === "connecting"}
+                    class:warning={signalingStatus === "error" || signalingStatus === "offline"}
+                  ></span>
+                  <div class="banner-text">
+                    <span class="banner-title">
+                      {#if signalingStatus === "online"}
+                        Connected & Ready (Cloud WAN Mode)
+                      {:else if signalingStatus === "connecting"}
+                        Connecting to Signaling Relay...
+                      {:else}
+                        Signaling Disconnected (LAN Only Fallback)
+                      {/if}
+                    </span>
+                    <span class="banner-sub">
+                      {#if signalingStatus === "online"}
+                        STUN NAT Traversal active via Google Public STUN. You can dial and receive connections across different Wi-Fi networks and mobile hotspots.
+                      {:else}
+                        {signalingStatusDetails || "Remote 9-digit connections require signaling. Check network or verify signaling server URL."}
+                      {/if}
+                    </span>
+                  </div>
+                </div>
+
+                <div class="signaling-url-config">
+                  <label class="url-label" for="signaling-url-field">Signaling Server Endpoint (WebSocket):</label>
+                  <div class="url-input-row">
+                    <input
+                      id="signaling-url-field"
+                      type="text"
+                      class="url-input"
+                      placeholder="wss://signaling.openremote.app"
+                      bind:value={signalingUrlInput}
+                    />
+                    <button
+                      class="btn-save-signaling"
+                      disabled={isSavingSignaling || !signalingUrlInput.trim()}
+                      onclick={saveSignalingUrl}
+                    >
+                      {#if isSavingSignaling}
+                        <span class="btn-spinner"></span>
+                        <span>Saving...</span>
+                      {:else}
+                        <span>Save & Reconnect</span>
+                      {/if}
+                    </button>
+                  </div>
+                  <p class="url-hint">
+                    Default: <code>wss://signaling.openremote.app</code>. You can also self-host using the Node.js or Cloudflare Worker script in <code>/signaling-server</code>.
+                  </p>
+                </div>
+              </div>
+            </div>
+
             <!-- Software Update Card -->
             <div class="engine-section-card">
               <div class="card-caption">
@@ -2125,9 +2357,9 @@
             <span class="engine-tech">Native SendInput</span>
           </div>
           <div class="engine-item">
-            <span class="engine-bullet">●</span>
-            <span class="engine-name">Channels:</span>
-            <span class="engine-tech">UDP (Control) + TCP (Frames)</span>
+            <span class="engine-bullet" style="color: {signalingStatus === 'online' ? '#22c55e' : '#f59e0b'};">●</span>
+            <span class="engine-name">Network:</span>
+            <span class="engine-tech">{signalingStatus === 'online' ? 'WAN WebRTC (STUN)' : 'LAN Direct (44321)'}</span>
           </div>
         </div>
       </div>
@@ -2933,11 +3165,61 @@
     height: 8px;
     border-radius: 50%;
     background: #64748b;
+    flex-shrink: 0;
   }
 
   .status-dot.active {
     background: #22c55e;
     box-shadow: 0 0 8px #22c55e;
+  }
+
+  .status-dot.connecting {
+    background: #3b82f6;
+    box-shadow: 0 0 8px #3b82f6;
+    animation: status-pulse 1.4s ease-in-out infinite;
+  }
+
+  .status-dot.warning {
+    background: #f59e0b;
+    box-shadow: 0 0 8px #f59e0b;
+  }
+
+  @keyframes status-pulse {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.4;
+      transform: scale(0.85);
+    }
+  }
+
+  .cloud-badge {
+    margin-left: 8px;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 10px;
+    background: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .cloud-badge.connecting {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+  }
+
+  .cloud-badge.lan {
+    background: rgba(245, 158, 11, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.3);
   }
 
   .desk-footer {
@@ -3845,6 +4127,113 @@
     background: #0284c7;
     border-color: #38bdf8;
     color: #fff;
+  }
+
+  /* Public Cloud Signaling & NAT Traversal Card Styles */
+  .signaling-card-content {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    margin-top: 14px;
+  }
+  .signaling-status-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 14px 16px;
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .signaling-status-banner.online {
+    background: rgba(34, 197, 94, 0.08);
+    border-color: rgba(34, 197, 94, 0.25);
+  }
+  .signaling-status-banner.connecting {
+    background: rgba(59, 130, 246, 0.08);
+    border-color: rgba(59, 130, 246, 0.25);
+  }
+  .signaling-status-banner.error {
+    background: rgba(245, 158, 11, 0.08);
+    border-color: rgba(245, 158, 11, 0.25);
+  }
+  .banner-text {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .banner-title {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #f1f5f9;
+  }
+  .banner-sub {
+    font-size: 0.78rem;
+    color: #94a3b8;
+    line-height: 1.4;
+  }
+  .signaling-url-config {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .url-label {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: #94a3b8;
+  }
+  .url-input-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  .url-input {
+    flex: 1;
+    background: rgba(15, 23, 42, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: #f1f5f9;
+    font-size: 0.82rem;
+    font-family: monospace;
+    outline: none;
+    transition: border-color 0.15s ease;
+  }
+  .url-input:focus {
+    border-color: #38bdf8;
+  }
+  .btn-save-signaling {
+    background: #0284c7;
+    border: 1px solid #38bdf8;
+    color: #fff;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s ease;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-save-signaling:hover:not(:disabled) {
+    background: #0369a1;
+  }
+  .btn-save-signaling:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .url-hint {
+    font-size: 0.74rem;
+    color: #64748b;
+    margin: 0;
+  }
+  .url-hint code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 2px 5px;
+    border-radius: 4px;
+    color: #94a3b8;
   }
 
   /* Modal Backdrop & Card */

@@ -1,0 +1,22 @@
+{
+  "name": "openremote-signaling-server",
+  "version": "1.0.0",
+  "description": "High performance WebRTC signaling and rendezvous server for OpenRemote",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "keywords": [
+    "openremote",
+    "webrtc",
+    "signaling",
+    "stun",
+    "remote-desktop"
+  ],
+  "author": "OpenRemote Team",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
