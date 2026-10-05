@@ -96,9 +96,11 @@
 
   // Multi-Monitor state (Host local vs Remote)
   let availableMonitors = $state<MonitorDescriptor[]>([]);
-  let activeMonitorIndex = $state(1);
+  let activeMonitorIndex = $state(0);
   let remoteDisplays = $state<RemoteDisplay[]>([]);
-  let activeRemoteDisplayId = $state(1);
+  let activeRemoteDisplayId = $state(0);
+  let switchingDisplay = $state(false);
+  let switchingToDisplayIndex = $state<number | null>(null);
 
   // Recent Sessions History
   let recentSessions = $state<RecentSession[]>([]);
@@ -507,8 +509,17 @@
         webrtcSession.close();
       }
       webrtcSession = new WebRTCSession(signalingClient!, systemInfo?.peer_id || "");
-      webrtcSession.onControlMessage = (msg) => {
+      webrtcSession.onControlMessage = async (msg) => {
         console.log("[webrtc host] Received control msg:", msg);
+        if (msg.type === "request_display_switch") {
+          const targetIndex = msg.targetDisplayIndex !== undefined ? msg.targetDisplayIndex : msg.monitor_index;
+          try {
+            await invoke("switch_monitor", { monitorIndex: targetIndex });
+            activeMonitorIndex = targetIndex;
+          } catch (e) {
+            console.error("Failed to switch host monitor on request_display_switch:", e);
+          }
+        }
       };
       await webrtcSession.handleIncomingOffer(fromPeerId, sdp, feedPort);
       console.log(`[webrtc host] Call answered for ${fromPeerId}`);
@@ -610,11 +621,26 @@
   }
 
   async function switchRemoteDisplay(index: number) {
+    if (switchingDisplay && switchingToDisplayIndex === index) return;
+    switchingDisplay = true;
+    switchingToDisplayIndex = index;
+    activeRemoteDisplayId = index;
+
+    // 1. Send control message over WebRTC data channel if active WAN session
+    if (webrtcSession && webrtcSession.isConnected()) {
+      webrtcSession.sendControl({
+        type: "request_display_switch",
+        targetDisplayIndex: index,
+        monitor_index: index,
+      });
+      webrtcSession.sendInput({ SwitchMonitor: { monitor_index: index } });
+    }
+
+    // 2. Send over backend command for direct LAN TCP/UDP session
     try {
       await invoke("switch_remote_monitor", { monitorIndex: index });
-      activeRemoteDisplayId = index;
     } catch (err) {
-      console.error("Failed to switch remote display:", err);
+      console.warn("switch_remote_monitor notice:", err);
     }
   }
 
@@ -914,7 +940,9 @@
     remoteResolution = { width: 0, height: 0 };
     fps = 0;
     remoteDisplays = [];
-    activeRemoteDisplayId = 1;
+    activeRemoteDisplayId = 0;
+    switchingDisplay = false;
+    switchingToDisplayIndex = null;
     dirtyFramePending = false;
     clientAccessLevel = "Standard";
     if (canvasRef) {
@@ -930,9 +958,12 @@
     if (typeof data === "string") {
       try {
         const msg = JSON.parse(data);
-        if (msg.type === "display_manifest" && Array.isArray(msg.displays)) {
+        if ((msg.type === "display_manifest" || msg.type === "monitors_updated") && Array.isArray(msg.displays)) {
           remoteDisplays = msg.displays;
-          activeRemoteDisplayId = msg.active_display_id || 1;
+          if (msg.active_display_id !== undefined) {
+            activeRemoteDisplayId = msg.active_display_id;
+          }
+          switchingDisplay = false;
         } else if (msg.type === "permission_update" && msg.access_level) {
           clientAccessLevel = msg.access_level;
           console.log("Remote permission level updated to:", clientAccessLevel);
@@ -945,6 +976,9 @@
 
     if (!(data instanceof ArrayBuffer)) return;
     frameCount++;
+    if (switchingDisplay) {
+      switchingDisplay = false;
+    }
 
     const buffer = data;
     if (buffer.byteLength < 36) return;
@@ -1589,21 +1623,34 @@
           {#if remoteDisplays.length > 1}
             <div class="monitor-switcher" data-tauri-drag-region="false">
               <span class="switcher-title">Display:</span>
-              {#each remoteDisplays as disp}
+              {#each remoteDisplays as disp, i}
                 <button
                   class="btn-mon-pill"
                   class:active={activeRemoteDisplayId === disp.id}
                   onclick={() => switchRemoteDisplay(disp.id)}
                   title={`${disp.name} (${disp.width}x${disp.height})`}
+                  disabled={switchingDisplay && switchingToDisplayIndex === disp.id}
                 >
-                  🖥 Display {disp.id}
+                  {#if switchingDisplay && switchingToDisplayIndex === disp.id}
+                    <span class="btn-spinner"></span>
+                  {:else}
+                    <span class="mon-icon">🖥</span>
+                  {/if}
+                  Display {i + 1}
                 </button>
               {/each}
+
+              {#if switchingDisplay}
+                <span class="switching-feedback">
+                  <span class="feedback-spinner"></span>
+                  Switching to Display {((switchingToDisplayIndex ?? 0) < remoteDisplays.length ? (switchingToDisplayIndex ?? 0) + 1 : 1)}...
+                </span>
+              {/if}
             </div>
           {:else}
             <div class="monitor-badge" data-tauri-drag-region="false" title="Connected Remote Display">
               <span class="badge-icon">🖥</span>
-              <span class="device-name">{remoteDisplays[0]?.name || "DELL E2421HN"}</span>
+              <span class="device-name">{remoteDisplays[0]?.name || "Display 1"}</span>
             </div>
           {/if}
 
@@ -2951,9 +2998,10 @@
   .titlebar-left {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 12px;
     height: 100%;
-    flex: 1 1 0;
+    flex: 0 0 auto;
+    margin-right: 18px;
     min-width: 0;
     -webkit-app-region: drag;
   }
@@ -2990,7 +3038,8 @@
     font-size: 0.72rem;
     font-family: monospace;
     color: #38bdf8;
-    margin-left: 6px;
+    margin-left: 2px;
+    margin-right: 4px;
     -webkit-app-region: no-drag;
     white-space: nowrap;
     flex-shrink: 0;
@@ -3004,14 +3053,14 @@
   }
 
   .titlebar-center {
-    flex: 2 1 auto;
+    flex: 1 1 auto;
     height: 100%;
     display: flex;
     align-items: center;
     justify-content: center;
     -webkit-app-region: drag;
     min-width: 0;
-    padding: 0 8px;
+    padding: 0 12px;
     box-sizing: border-box;
   }
 
@@ -3490,10 +3539,11 @@
   .monitor-switcher {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    padding: 0 8px;
+    gap: 6px;
+    padding: 0 10px;
     border-left: 1px solid rgba(255, 255, 255, 0.12);
     border-right: 1px solid rgba(255, 255, 255, 0.12);
+    margin-right: 8px;
     height: 24px;
     box-sizing: border-box;
   }
@@ -3532,10 +3582,10 @@
 
   .btn-mon-pill {
     background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.12);
     color: #94a3b8;
-    padding: 3px 8px;
-    border-radius: 5px;
+    padding: 3px 10px;
+    border-radius: 6px;
     font-size: 0.72rem;
     font-weight: 600;
     cursor: pointer;
@@ -3543,20 +3593,54 @@
     height: 24px;
     display: inline-flex;
     align-items: center;
+    gap: 5px;
     box-sizing: border-box;
+    white-space: nowrap;
   }
 
-  .btn-mon-pill:hover {
-    background: rgba(56, 189, 248, 0.15);
-    color: #38bdf8;
-    border-color: rgba(56, 189, 248, 0.3);
+  .btn-mon-pill:hover:not(:disabled) {
+    background: rgba(79, 70, 229, 0.2);
+    color: #c7d2fe;
+    border-color: rgba(99, 102, 241, 0.4);
   }
 
   .btn-mon-pill.active {
-    background: #0284c7;
-    color: #ffffff;
-    border-color: #38bdf8;
-    box-shadow: 0 1px 6px rgba(2, 132, 199, 0.4);
+    background: #4f46e5 !important; /* bg-indigo-600 */
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    border-color: #818cf8 !important;
+    box-shadow: 0 0 10px rgba(99, 102, 241, 0.5) !important;
+  }
+
+  .btn-mon-pill:disabled {
+    opacity: 0.7;
+    cursor: wait;
+  }
+
+  .btn-spinner,
+  .feedback-spinner {
+    width: 10px;
+    height: 10px;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-top-color: #ffffff;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    display: inline-block;
+  }
+
+  .switching-feedback {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.72rem;
+    color: #818cf8;
+    font-weight: 600;
+    padding: 0 6px;
+    white-space: nowrap;
+  }
+
+  .mon-icon {
+    font-size: 0.76rem;
   }
 
   .hud-tag {

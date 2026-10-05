@@ -280,7 +280,14 @@ impl DirectLanHost {
                 if let InputEvent::SwitchMonitor { monitor_index } = event {
                     let _ = capturer.switch_monitor(*monitor_index);
                     let monitors = ScreenCapturer::enumerate_monitors();
-                    if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
+                    let target_idx = if *monitor_index < monitors.len() {
+                        *monitor_index
+                    } else if *monitor_index > 0 && (*monitor_index - 1) < monitors.len() {
+                        *monitor_index - 1
+                    } else {
+                        0
+                    };
+                    if let Some(m) = monitors.get(target_idx) {
                         injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
                     }
                 }
@@ -290,7 +297,14 @@ impl DirectLanHost {
                     InputEvent::SwitchMonitor { monitor_index } => {
                         let _ = capturer.switch_monitor(*monitor_index);
                         let monitors = ScreenCapturer::enumerate_monitors();
-                        if let Some(m) = monitors.iter().find(|m| m.index == *monitor_index) {
+                        let target_idx = if *monitor_index < monitors.len() {
+                            *monitor_index
+                        } else if *monitor_index > 0 && (*monitor_index - 1) < monitors.len() {
+                            *monitor_index - 1
+                        } else {
+                            0
+                        };
+                        if let Some(m) = monitors.get(target_idx) {
                             injector.set_active_monitor_bounds(m.x, m.y, m.width, m.height);
                         }
                     }
@@ -644,10 +658,31 @@ impl DirectLanHost {
                         let mut last_monitor = cap.active_monitor_index();
                         let mut send_monitors = true;
                         let mut last_send_time = tokio::time::Instant::now();
+                        let mut last_mon_check_time = tokio::time::Instant::now();
+                        let mut last_mon_count = ScreenCapturer::enumerate_monitors().len();
 
                         loop {
                             let current_seq = cap.frame_counter();
                             let current_mon = cap.active_monitor_index();
+
+                            // Periodic hotplug & topology check every 1000ms
+                            if last_mon_check_time.elapsed().as_millis() >= 1000 {
+                                last_mon_check_time = tokio::time::Instant::now();
+                                let current_monitors = ScreenCapturer::enumerate_monitors();
+                                if current_monitors.len() != last_mon_count {
+                                    eprintln!(
+                                        "[core-net] Display configuration change detected (count: {} -> {})",
+                                        last_mon_count,
+                                        current_monitors.len()
+                                    );
+                                    last_mon_count = current_monitors.len();
+                                    send_monitors = true;
+                                    if cap.active_monitor_index() >= current_monitors.len() {
+                                        let _ = cap.switch_monitor(0);
+                                    }
+                                    enc.reset();
+                                }
+                            }
 
                             if current_mon != last_monitor {
                                 last_monitor = current_mon;

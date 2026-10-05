@@ -356,7 +356,14 @@ fn start_gdi(x: i32, y: i32, width: u32, height: u32, shared: CaptureShared) -> 
 }
 
 #[cfg(target_os = "windows")]
-fn enumerate_monitors_win32() -> Vec<MonitorDescriptor> {
+#[derive(Clone, Debug)]
+pub struct Win32MonitorEntry {
+    pub hmonitor: windows_sys::Win32::Graphics::Gdi::HMONITOR,
+    pub descriptor: MonitorDescriptor,
+}
+
+#[cfg(target_os = "windows")]
+pub fn enumerate_win32_monitors_full() -> Vec<Win32MonitorEntry> {
     use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
     use windows_sys::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
@@ -368,23 +375,35 @@ fn enumerate_monitors_win32() -> Vec<MonitorDescriptor> {
         _rc: *mut RECT,
         lparam: LPARAM,
     ) -> BOOL {
-        let list = &mut *(lparam as *mut Vec<MonitorDescriptor>);
+        let list = &mut *(lparam as *mut Vec<Win32MonitorEntry>);
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
 
         if GetMonitorInfoW(hmon, &mut mi) != 0 {
-            let index = list.len() + 1;
+            let index = list.len();
             let width = (mi.rcMonitor.right - mi.rcMonitor.left).max(1) as u32;
             let height = (mi.rcMonitor.bottom - mi.rcMonitor.top).max(1) as u32;
             let is_primary = (mi.dwFlags & 1) != 0;
-            list.push(MonitorDescriptor {
-                index,
-                name: format!("Display {}", index),
-                width,
-                height,
-                is_primary,
-                x: mi.rcMonitor.left,
-                y: mi.rcMonitor.top,
+
+            let friendly_name = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mon = Monitor::from_raw_hmonitor(hmon as *mut std::ffi::c_void);
+                mon.name().ok()
+            }))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| format!("Display {}", index + 1));
+
+            list.push(Win32MonitorEntry {
+                hmonitor: hmon,
+                descriptor: MonitorDescriptor {
+                    index,
+                    name: friendly_name,
+                    width,
+                    height,
+                    is_primary,
+                    x: mi.rcMonitor.left,
+                    y: mi.rcMonitor.top,
+                },
             });
         }
         TRUE
@@ -399,6 +418,22 @@ fn enumerate_monitors_win32() -> Vec<MonitorDescriptor> {
             &mut list as *mut _ as LPARAM,
         );
     }
+
+    if list.is_empty() {
+        list.push(Win32MonitorEntry {
+            hmonitor: std::ptr::null_mut(),
+            descriptor: MonitorDescriptor {
+                index: 0,
+                name: "Display 1".to_string(),
+                width: 1920,
+                height: 1080,
+                is_primary: true,
+                x: 0,
+                y: 0,
+            },
+        });
+    }
+
     list
 }
 
@@ -496,11 +531,11 @@ pub mod macos_capture {
                     unsafe { CGDisplayPixelsHigh(d_id) as u32 }
                 };
                 let is_primary = d_id == main_id;
-                let index = i + 1;
+                let index = i;
                 let name = if is_primary {
-                    format!("Display {} (Built-in / Primary)", index)
+                    format!("Display {} (Built-in / Primary)", index + 1)
                 } else {
-                    format!("Display {} (External)", index)
+                    format!("Display {} (External)", index + 1)
                 };
 
                 list.push(MonitorDescriptor {
@@ -517,7 +552,7 @@ pub mod macos_capture {
 
         if list.is_empty() {
             list.push(MonitorDescriptor {
-                index: 1,
+                index: 0,
                 name: "Primary Display".to_string(),
                 width: 1920,
                 height: 1080,
@@ -535,7 +570,9 @@ pub mod macos_capture {
         let mut display_count = 0u32;
         let err = unsafe { CGGetActiveDisplayList(16, displays.as_mut_ptr(), &mut display_count) };
         if err == 0 && display_count > 0 {
-            let idx = if index >= 1 && index <= display_count as usize {
+            let idx = if index < display_count as usize {
+                index
+            } else if index > 0 && (index - 1) < display_count as usize {
                 index - 1
             } else {
                 0
@@ -646,42 +683,10 @@ impl ScreenCapturer {
     pub fn enumerate_monitors() -> Vec<MonitorDescriptor> {
         #[cfg(target_os = "windows")]
         {
-            let mut list = Vec::new();
-            if let Ok(monitors) = std::panic::catch_unwind(|| Monitor::enumerate()) {
-                if let Ok(monitors) = monitors {
-                    for (i, m) in monitors.into_iter().enumerate() {
-                        let index = i + 1;
-                        let name = m.name().unwrap_or_else(|_| format!("Display {}", index));
-                        let width = m.width().unwrap_or(1920);
-                        let height = m.height().unwrap_or(1080);
-                        let is_primary = index == 1;
-                        list.push(MonitorDescriptor {
-                            index,
-                            name,
-                            width,
-                            height,
-                            is_primary,
-                            x: 0,
-                            y: 0,
-                        });
-                    }
-                }
-            }
-            if list.is_empty() {
-                list = enumerate_monitors_win32();
-            }
-            if list.is_empty() {
-                list.push(MonitorDescriptor {
-                    index: 1,
-                    name: "Primary Display".to_string(),
-                    width: 1920,
-                    height: 1080,
-                    is_primary: true,
-                    x: 0,
-                    y: 0,
-                });
-            }
-            list
+            enumerate_win32_monitors_full()
+                .into_iter()
+                .map(|e| e.descriptor)
+                .collect()
         }
         #[cfg(target_os = "macos")]
         {
@@ -690,7 +695,7 @@ impl ScreenCapturer {
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             vec![MonitorDescriptor {
-                index: 1,
+                index: 0,
                 name: "Primary Display".to_string(),
                 width: 1920,
                 height: 1080,
@@ -702,29 +707,23 @@ impl ScreenCapturer {
     }
 
     pub fn new() -> Result<Self, CaptureError> {
-        Self::new_with_monitor_index(1)
+        Self::new_with_monitor_index(0)
     }
 
     pub fn new_with_monitor_index(index: usize) -> Result<Self, CaptureError> {
         #[cfg(target_os = "windows")]
         {
-            let monitors = Self::enumerate_monitors();
-            let mon_desc = monitors
-                .iter()
-                .find(|m| m.index == index)
-                .cloned()
-                .unwrap_or_else(|| {
-                    monitors.first().cloned().unwrap_or(MonitorDescriptor {
-                        index: 1,
-                        name: "Primary Display".to_string(),
-                        width: 1920,
-                        height: 1080,
-                        is_primary: true,
-                        x: 0,
-                        y: 0,
-                    })
-                });
+            let all_monitors = enumerate_win32_monitors_full();
+            let target_idx = if index < all_monitors.len() {
+                index
+            } else if index > 0 && (index - 1) < all_monitors.len() {
+                index - 1
+            } else {
+                0
+            };
 
+            let target_entry = &all_monitors[target_idx];
+            let mon_desc = &target_entry.descriptor;
             let width = mon_desc.width;
             let height = mon_desc.height;
 
@@ -733,34 +732,27 @@ impl ScreenCapturer {
                 frame_counter: Arc::new(AtomicU64::new(0)),
             };
 
-            let monitor_opt = if index <= 1 {
-                Monitor::primary().ok()
-            } else {
-                Monitor::from_index(index)
-                    .ok()
-                    .or_else(|| Monitor::primary().ok())
-            };
-
-            let backend = if let Some(mon) = monitor_opt {
+            let backend = if !target_entry.hmonitor.is_null() {
+                let mon = Monitor::from_raw_hmonitor(target_entry.hmonitor as *mut std::ffi::c_void);
                 match try_start_wgc(mon, shared.clone()) {
                     Ok(ctrl) => {
-                        eprintln!("[core-capture] Active backend: Windows Graphics Capture (WGC)");
+                        eprintln!("[core-capture] Active backend on {}: Windows Graphics Capture (WGC)", mon_desc.name);
                         BackendControl::Wgc(ctrl)
                     }
                     Err(wgc_err) => {
                         eprintln!(
-                            "[core-capture] WGC unavailable ({:?}), trying DXGI Duplication...",
-                            wgc_err
+                            "[core-capture] WGC unavailable for {} ({:?}), trying DXGI Duplication...",
+                            mon_desc.name, wgc_err
                         );
                         match try_start_dxgi(mon, shared.clone()) {
                             Ok(ctrl) => {
-                                eprintln!("[core-capture] Active backend: DXGI Desktop Duplication");
+                                eprintln!("[core-capture] Active backend on {}: DXGI Desktop Duplication", mon_desc.name);
                                 ctrl
                             }
                             Err(dxgi_err) => {
                                 eprintln!(
-                                    "[core-capture] DXGI unavailable ({:?}), falling back to Win32 GDI...",
-                                    dxgi_err
+                                    "[core-capture] DXGI unavailable for {} ({:?}), falling back to Win32 GDI at ({}, {})...",
+                                    mon_desc.name, dxgi_err, mon_desc.x, mon_desc.y
                                 );
                                 start_gdi(mon_desc.x, mon_desc.y, width, height, shared.clone())
                             }
@@ -768,14 +760,13 @@ impl ScreenCapturer {
                     }
                 }
             } else {
-                eprintln!("[core-capture] Monitor WinRT handle not found, using Win32 GDI capture...");
                 start_gdi(mon_desc.x, mon_desc.y, width, height, shared.clone())
             };
 
             Ok(Self {
                 shared,
                 control: Arc::new(Mutex::new(Some(backend))),
-                active_monitor_index: Arc::new(AtomicUsize::new(index)),
+                active_monitor_index: Arc::new(AtomicUsize::new(target_idx)),
                 width,
                 height,
             })
@@ -783,21 +774,23 @@ impl ScreenCapturer {
         #[cfg(target_os = "macos")]
         {
             let monitors = Self::enumerate_monitors();
-            let mon_desc = monitors
-                .iter()
-                .find(|m| m.index == index)
-                .cloned()
-                .unwrap_or_else(|| {
-                    monitors.first().cloned().unwrap_or(MonitorDescriptor {
-                        index: 1,
-                        name: "Primary Display".to_string(),
-                        width: 1920,
-                        height: 1080,
-                        is_primary: true,
-                        x: 0,
-                        y: 0,
-                    })
-                });
+            let target_idx = if index < monitors.len() {
+                index
+            } else if index > 0 && (index - 1) < monitors.len() {
+                index - 1
+            } else {
+                0
+            };
+
+            let mon_desc = monitors.get(target_idx).cloned().unwrap_or(MonitorDescriptor {
+                index: 0,
+                name: "Primary Display".to_string(),
+                width: 1920,
+                height: 1080,
+                is_primary: true,
+                x: 0,
+                y: 0,
+            });
 
             let width = mon_desc.width;
             let height = mon_desc.height;
@@ -807,13 +800,13 @@ impl ScreenCapturer {
                 frame_counter: Arc::new(AtomicU64::new(0)),
             };
 
-            let display_id = macos_capture::get_display_id_by_index(index);
+            let display_id = macos_capture::get_display_id_by_index(target_idx);
             let ctrl = macos_capture::start_macos_capture(display_id, shared.clone());
 
             Ok(Self {
                 shared,
                 control: Arc::new(Mutex::new(Some(ctrl))),
-                active_monitor_index: Arc::new(AtomicUsize::new(index)),
+                active_monitor_index: Arc::new(AtomicUsize::new(target_idx)),
                 width,
                 height,
             })
@@ -836,56 +829,49 @@ impl ScreenCapturer {
     pub fn switch_monitor(&self, index: usize) -> Result<(), CaptureError> {
         #[cfg(target_os = "windows")]
         {
-            let monitors = Self::enumerate_monitors();
-            let mon_desc = monitors
-                .iter()
-                .find(|m| m.index == index)
-                .cloned()
-                .unwrap_or_else(|| {
-                    monitors.first().cloned().unwrap_or(MonitorDescriptor {
-                        index: 1,
-                        name: "Primary Display".to_string(),
-                        width: 1920,
-                        height: 1080,
-                        is_primary: true,
-                        x: 0,
-                        y: 0,
-                    })
-                });
+            let all_monitors = enumerate_win32_monitors_full();
+            let target_idx = if index < all_monitors.len() {
+                index
+            } else if index > 0 && (index - 1) < all_monitors.len() {
+                index - 1
+            } else {
+                0
+            };
 
+            let target_entry = &all_monitors[target_idx];
+            let mon_desc = &target_entry.descriptor;
             let width = mon_desc.width;
             let height = mon_desc.height;
 
-            let monitor_opt = if index <= 1 {
-                Monitor::primary().ok()
-            } else {
-                Monitor::from_index(index)
-                    .ok()
-                    .or_else(|| Monitor::primary().ok())
-            };
-
-            let new_backend = if let Some(mon) = monitor_opt {
+            let new_backend = if !target_entry.hmonitor.is_null() {
+                let mon = Monitor::from_raw_hmonitor(target_entry.hmonitor as *mut std::ffi::c_void);
                 match try_start_wgc(mon, self.shared.clone()) {
-                    Ok(ctrl) => BackendControl::Wgc(ctrl),
-                    Err(_) => match try_start_dxgi(mon, self.shared.clone()) {
-                        Ok(ctrl) => ctrl,
-                        Err(_) => start_gdi(
-                            mon_desc.x,
-                            mon_desc.y,
-                            width,
-                            height,
-                            self.shared.clone(),
-                        ),
-                    },
+                    Ok(ctrl) => {
+                        eprintln!("[core-capture] Switched to {}: Windows Graphics Capture (WGC)", mon_desc.name);
+                        BackendControl::Wgc(ctrl)
+                    }
+                    Err(wgc_err) => {
+                        eprintln!(
+                            "[core-capture] WGC switch unavailable for {} ({:?}), trying DXGI Duplication...",
+                            mon_desc.name, wgc_err
+                        );
+                        match try_start_dxgi(mon, self.shared.clone()) {
+                            Ok(ctrl) => {
+                                eprintln!("[core-capture] Switched to {}: DXGI Desktop Duplication", mon_desc.name);
+                                ctrl
+                            }
+                            Err(dxgi_err) => {
+                                eprintln!(
+                                    "[core-capture] DXGI switch unavailable for {} ({:?}), falling back to Win32 GDI at ({}, {})...",
+                                    mon_desc.name, dxgi_err, mon_desc.x, mon_desc.y
+                                );
+                                start_gdi(mon_desc.x, mon_desc.y, width, height, self.shared.clone())
+                            }
+                        }
+                    }
                 }
             } else {
-                start_gdi(
-                    mon_desc.x,
-                    mon_desc.y,
-                    width,
-                    height,
-                    self.shared.clone(),
-                )
+                start_gdi(mon_desc.x, mon_desc.y, width, height, self.shared.clone())
             };
 
             let mut guard = self.control.lock();
@@ -893,12 +879,21 @@ impl ScreenCapturer {
                 old_backend.stop();
             }
             *guard = Some(new_backend);
-            self.active_monitor_index.store(index, Ordering::SeqCst);
+            self.active_monitor_index.store(target_idx, Ordering::SeqCst);
             Ok(())
         }
         #[cfg(target_os = "macos")]
         {
-            let display_id = macos_capture::get_display_id_by_index(index);
+            let monitors = Self::enumerate_monitors();
+            let target_idx = if index < monitors.len() {
+                index
+            } else if index > 0 && (index - 1) < monitors.len() {
+                index - 1
+            } else {
+                0
+            };
+
+            let display_id = macos_capture::get_display_id_by_index(target_idx);
             let new_ctrl = macos_capture::start_macos_capture(display_id, self.shared.clone());
 
             let mut guard = self.control.lock();
@@ -906,7 +901,7 @@ impl ScreenCapturer {
                 old_ctrl.stop();
             }
             *guard = Some(new_ctrl);
-            self.active_monitor_index.store(index, Ordering::SeqCst);
+            self.active_monitor_index.store(target_idx, Ordering::SeqCst);
             Ok(())
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]

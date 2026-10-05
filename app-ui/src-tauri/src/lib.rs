@@ -511,9 +511,16 @@ async fn internal_connect_to_socket_addr(
                                 let manifest_json = serde_json::to_string(&serde_json::json!({
                                     "type": "display_manifest",
                                     "displays": displays,
-                                    "active_display_id": meta.active_monitor.unwrap_or(1),
+                                    "active_display_id": meta.active_monitor.unwrap_or(0),
                                 })).unwrap_or_default();
                                 let _ = ws_stream.send(Message::Text(manifest_json.into())).await;
+
+                                let updated_json = serde_json::to_string(&serde_json::json!({
+                                    "type": "monitors_updated",
+                                    "displays": displays,
+                                    "active_display_id": meta.active_monitor.unwrap_or(0),
+                                })).unwrap_or_default();
+                                let _ = ws_stream.send(Message::Text(updated_json.into())).await;
                             }
 
                             // Forward live permission updates from host
