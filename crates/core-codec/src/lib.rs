@@ -96,7 +96,6 @@ impl FrameEncoder {
                     monitors: None,
                     active_monitor: None,
                     access_level: None,
-                    host_input_active: None,
                 },
                 payload: compressed,
             }));
@@ -152,7 +151,6 @@ impl FrameEncoder {
                 monitors: None,
                 active_monitor: None,
                 access_level: None,
-                host_input_active: None,
             },
             payload: compressed,
         }))

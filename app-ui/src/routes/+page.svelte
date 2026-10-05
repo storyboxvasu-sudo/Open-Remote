@@ -143,10 +143,6 @@
   let unlistenIncoming: UnlistenFn | null = null;
   let unlistenSession: UnlistenFn | null = null;
 
-  // Host Input Priority & Forbidden Cursor State
-  let isHostInputLocked = $state(false);
-  let clientCursorPos = $state({ x: 0, y: 0 });
-
   // Unattended Access State
   interface UnattendedAccessSummary {
     enabled: boolean;
@@ -834,7 +830,6 @@
     activeRemoteDisplayId = 1;
     dirtyFramePending = false;
     clientAccessLevel = "Standard";
-    isHostInputLocked = false;
     if (canvasRef) {
       const ctx = canvasRef.getContext("2d");
       if (ctx) ctx.clearRect(0, 0, canvasRef.width, canvasRef.height);
@@ -854,9 +849,6 @@
         } else if (msg.type === "permission_update" && msg.access_level) {
           clientAccessLevel = msg.access_level;
           console.log("Remote permission level updated to:", clientAccessLevel);
-        } else if (msg.type === "host_input_active") {
-          isHostInputLocked = !!msg.locked;
-          console.log("Host input lock state:", isHostInputLocked);
         }
       } catch (e) {
         console.error("Stream json parse error:", e);
@@ -945,7 +937,7 @@
   }
 
   async function sendRemoteInput(event: any) {
-    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     if (webrtcSession && webrtcSession.isConnected()) {
       webrtcSession.sendInput(event);
       return;
@@ -975,7 +967,7 @@
 
   function handleTouchStart(e: TouchEvent) {
     if (!isConnected) return;
-    if (clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
 
     if (e.touches.length === 1) {
@@ -1022,7 +1014,7 @@
 
   async function handleTouchMove(e: TouchEvent) {
     if (!isConnected) return;
-    if ((clientAccessLevel === "ViewOnly" || isHostInputLocked) && zoomScale <= 1.05) return;
+    if (clientAccessLevel === "ViewOnly" && zoomScale <= 1.05) return;
     e.preventDefault();
 
     if (e.touches.length === 1) {
@@ -1072,7 +1064,7 @@
 
   async function handleTouchEnd(e: TouchEvent) {
     if (!isConnected) return;
-    if (clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
     if (holdTimer) clearTimeout(holdTimer);
 
@@ -1156,7 +1148,7 @@
   }
 
   async function handleVirtualKeyDown(e: KeyboardEvent) {
-    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     if (e.key === "Backspace") {
       await sendRemoteInput({ type: "KeyDown", data: { scancode: 8, key: "Backspace" } });
       setTimeout(() => sendRemoteInput({ type: "KeyUp", data: { scancode: 8, key: "Backspace" } }), 25);
@@ -1167,7 +1159,7 @@
   }
 
   async function handleVirtualInput(e: Event) {
-    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     const input = e.target as HTMLInputElement;
     const val = input.value;
     if (!val) return;
@@ -1179,8 +1171,7 @@
   }
 
   async function handleMouseMove(e: MouseEvent) {
-    clientCursorPos = { x: e.clientX, y: e.clientY };
-    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     const now = performance.now();
     if (now - lastMoveTime < 8) return;
     lastMoveTime = now;
@@ -1193,7 +1184,7 @@
   }
 
   async function handleMouseDown(e: MouseEvent) {
-    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
     const { x, y } = getNormalizedCoordinates(e);
     const button = e.button === 0 ? "Left" : e.button === 1 ? "Middle" : "Right";
@@ -1205,7 +1196,7 @@
   }
 
   async function handleMouseUp(e: MouseEvent) {
-    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
     const { x, y } = getNormalizedCoordinates(e);
     const button = e.button === 0 ? "Left" : e.button === 1 ? "Middle" : "Right";
@@ -1217,7 +1208,7 @@
   }
 
   async function handleWheel(e: WheelEvent) {
-    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     e.preventDefault();
     await sendRemoteInput({
       type: "MouseWheel",
@@ -1229,7 +1220,7 @@
   }
 
   async function handleKeyDown(e: KeyboardEvent) {
-    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
     if (tag === "input" || tag === "textarea") return;
 
@@ -1244,7 +1235,7 @@
   }
 
   async function handleKeyUp(e: KeyboardEvent) {
-    if (!isConnected || clientAccessLevel === "ViewOnly" || isHostInputLocked) return;
+    if (!isConnected || clientAccessLevel === "ViewOnly") return;
     const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
     if (tag === "input" || tag === "textarea") return;
 
@@ -1547,16 +1538,6 @@
             {/if}
           </div>
 
-          {#if isHostInputLocked}
-            <div
-              class="hud-tag metric-host-locked"
-              data-tauri-drag-region="false"
-              title="Host machine input is active. Remote input is paused."
-            >
-              ⛔ Host Active
-            </div>
-          {/if}
-
           <!-- System Metrics: Resolution, FPS, MS -->
           {#if remoteResolution.width > 0}
             <div class="hud-tag res" data-tauri-drag-region="false" title="Resolution">
@@ -1640,7 +1621,6 @@
       <!-- Remote Canvas Viewport -->
       <div
         class="remote-viewport"
-        class:host-input-locked={isHostInputLocked}
         bind:this={canvasContainerRef}
         role="region"
         aria-label="Remote Session"
@@ -1660,7 +1640,6 @@
         <canvas
           bind:this={canvasRef}
           class="canvas-element"
-          class:cursor-locked={isHostInputLocked}
           style="transform: translate({panX}px, {panY}px) scale({zoomScale}); transform-origin: center center;"
           onmousemove={handleMouseMove}
           onmousedown={handleMouseDown}
@@ -1672,21 +1651,6 @@
           ontouchcancel={handleTouchCancel}
           oncontextmenu={(e) => e.preventDefault()}
         ></canvas>
-
-        {#if isHostInputLocked}
-          <!-- AnyDesk-style Floating Forbidden Cursor Badge -->
-          <div
-            class="forbidden-cursor-badge"
-            style="left: {clientCursorPos.x + 14}px; top: {clientCursorPos.y + 14}px;"
-            aria-hidden="true"
-          >
-            <svg viewBox="0 0 24 24" width="20" height="20" fill="none">
-              <circle cx="12" cy="12" r="9.5" stroke="#ef4444" stroke-width="2.5" fill="rgba(239, 68, 68, 0.2)" />
-              <line x1="5.5" y1="5.5" x2="18.5" y2="18.5" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" />
-            </svg>
-            <span class="forbidden-tooltip">Host Active</span>
-          </div>
-        {/if}
 
         <!-- Floating Quick HUD (Only active during Fullscreen Mode, perfectly centered) -->
         {#if isFullscreen}
@@ -1740,12 +1704,6 @@
                 🛡 Full Access
               {/if}
             </div>
-
-            {#if isHostInputLocked}
-              <div class="hud-tag metric-host-locked" title="Host machine input active. Remote input paused.">
-                ⛔ Host Active
-              </div>
-            {/if}
 
             {#if remoteResolution.width > 0}
               <div class="hud-tag res">{remoteResolution.width}x{remoteResolution.height}</div>
@@ -3739,56 +3697,6 @@
     -webkit-user-select: none;
     overflow: hidden;
     position: relative;
-  }
-
-  .remote-viewport.host-input-locked,
-  .remote-viewport.host-input-locked .canvas-element,
-  .canvas-element.cursor-locked {
-    cursor: not-allowed !important;
-  }
-
-  /* AnyDesk-style Forbidden Cursor Badge Overlay */
-  .forbidden-cursor-badge {
-    position: fixed;
-    pointer-events: none;
-    z-index: 9999;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: rgba(15, 23, 42, 0.88);
-    backdrop-filter: blur(8px);
-    border: 1px solid rgba(239, 68, 68, 0.45);
-    border-radius: 20px;
-    padding: 3px 8px 3px 5px;
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5), 0 0 10px rgba(239, 68, 68, 0.25);
-    animation: forbiddenPulse 1.8s infinite;
-  }
-
-  .forbidden-tooltip {
-    font-size: 0.72rem;
-    font-weight: 700;
-    color: #fca5a5;
-    letter-spacing: 0.4px;
-    text-transform: uppercase;
-    white-space: nowrap;
-    user-select: none;
-  }
-
-  .hud-tag.metric-host-locked {
-    background: rgba(239, 68, 68, 0.22) !important;
-    border: 1px solid rgba(239, 68, 68, 0.5) !important;
-    color: #fca5a5 !important;
-    font-weight: 700;
-    animation: forbiddenPulse 1.8s infinite;
-  }
-
-  @keyframes forbiddenPulse {
-    0%, 100% {
-      opacity: 1;
-    }
-    50% {
-      opacity: 0.65;
-    }
   }
 
   .zoom-reset-btn {
