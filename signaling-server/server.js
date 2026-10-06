@@ -67,7 +67,14 @@ const wss = new WebSocketServer({ server });
 function sendJson(ws, action, payload = {}) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
-      ws.send(JSON.stringify({ action, payload }));
+      ws.send(
+        JSON.stringify({
+          type: action,
+          action,
+          ...payload,
+          payload,
+        })
+      );
     } catch (err) {
       console.error("[signaling] Failed to send message:", err.message);
     }
@@ -107,17 +114,18 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    const action = msg.action;
-    const payload = msg.payload || {};
+    const action = msg.type || msg.action;
+    const payload = msg.payload || msg;
 
     switch (action) {
       case "register": {
-        const rawPeerId = (payload.peer_id || "").trim();
+        const rawPeerId = String(payload.peerId || payload.peer_id || msg.peerId || msg.peer_id || "").trim();
         const normId = normalizePeerId(rawPeerId);
 
         if (!normId || normId.length < 6) {
           sendJson(ws, "registered", {
             peer_id: rawPeerId,
+            peerId: rawPeerId,
             success: false,
             reason: "Invalid peer ID format",
           });
@@ -134,7 +142,7 @@ wss.on("connection", (ws, req) => {
 
         peers.set(normId, {
           ws,
-          rawPeerId,
+          rawPeerId: normId,
           registeredAt: Date.now(),
         });
         sockets.set(ws, normId);
@@ -142,18 +150,22 @@ wss.on("connection", (ws, req) => {
         console.log(`[signaling] Registered: ${rawPeerId} (${normId}) from ${remoteIp} - Total active: ${peers.size}`);
 
         sendJson(ws, "registered", {
-          peer_id: rawPeerId,
+          peer_id: normId,
+          peerId: normId,
           success: true,
           active_peers: peers.size,
+          activePeers: peers.size,
         });
         break;
       }
 
       case "lookup": {
-        const target = normalizePeerId(payload.target);
+        const targetRaw = payload.target || msg.target || "";
+        const target = normalizePeerId(targetRaw);
         const online = peers.has(target);
         sendJson(ws, "lookup_result", {
-          target: payload.target,
+          target: target,
+          targetId: target,
           online,
         });
         break;
@@ -162,25 +174,30 @@ wss.on("connection", (ws, req) => {
       case "offer": {
         const senderNormId = sockets.get(ws);
         const senderEntry = senderNormId ? peers.get(senderNormId) : null;
-        const fromId = payload.from || (senderEntry ? senderEntry.rawPeerId : senderNormId) || "unknown";
+        const fromRaw = payload.from || msg.from || (senderEntry ? senderEntry.rawPeerId : senderNormId) || "unknown";
+        const fromNorm = normalizePeerId(fromRaw) || senderNormId || fromRaw;
 
-        const targetNormId = normalizePeerId(payload.target);
+        const targetRaw = payload.target || msg.target || "";
+        const targetNormId = normalizePeerId(targetRaw);
         const targetEntry = peers.get(targetNormId);
 
         if (!targetEntry || targetEntry.ws.readyState !== WebSocket.OPEN) {
-          console.log(`[signaling] Offer target ${payload.target} (${targetNormId}) is OFFLINE. Notifying sender.`);
+          console.log(`[signaling] Offer target ${targetRaw} (${targetNormId}) is OFFLINE. Notifying sender.`);
           sendJson(ws, "peer_not_found", {
-            target: payload.target,
+            target: targetRaw,
+            targetId: targetNormId,
             reason: "Partner ID is offline or not registered.",
           });
           return;
         }
 
-        console.log(`[signaling] Routing OFFER from ${fromId} -> ${targetEntry.rawPeerId}`);
+        console.log(`[signaling] Routing OFFER from ${fromRaw} (${fromNorm}) -> ${targetEntry.rawPeerId} (${targetNormId})`);
         sendJson(targetEntry.ws, "offer", {
-          target: payload.target,
-          from: fromId,
-          sdp: payload.sdp,
+          target: targetNormId,
+          targetId: targetNormId,
+          from: fromNorm,
+          fromId: fromNorm,
+          sdp: payload.sdp || msg.sdp,
         });
         break;
       }
@@ -188,24 +205,29 @@ wss.on("connection", (ws, req) => {
       case "answer": {
         const senderNormId = sockets.get(ws);
         const senderEntry = senderNormId ? peers.get(senderNormId) : null;
-        const fromId = payload.from || (senderEntry ? senderEntry.rawPeerId : senderNormId) || "unknown";
+        const fromRaw = payload.from || msg.from || (senderEntry ? senderEntry.rawPeerId : senderNormId) || "unknown";
+        const fromNorm = normalizePeerId(fromRaw) || senderNormId || fromRaw;
 
-        const targetNormId = normalizePeerId(payload.target);
+        const targetRaw = payload.target || msg.target || "";
+        const targetNormId = normalizePeerId(targetRaw);
         const targetEntry = peers.get(targetNormId);
 
         if (!targetEntry || targetEntry.ws.readyState !== WebSocket.OPEN) {
           sendJson(ws, "peer_not_found", {
-            target: payload.target,
+            target: targetRaw,
+            targetId: targetNormId,
             reason: "Partner ID is offline or not registered.",
           });
           return;
         }
 
-        console.log(`[signaling] Routing ANSWER from ${fromId} -> ${targetEntry.rawPeerId}`);
+        console.log(`[signaling] Routing ANSWER from ${fromRaw} (${fromNorm}) -> ${targetEntry.rawPeerId} (${targetNormId})`);
         sendJson(targetEntry.ws, "answer", {
-          target: payload.target,
-          from: fromId,
-          sdp: payload.sdp,
+          target: targetNormId,
+          targetId: targetNormId,
+          from: fromNorm,
+          fromId: fromNorm,
+          sdp: payload.sdp || msg.sdp,
         });
         break;
       }
@@ -213,23 +235,33 @@ wss.on("connection", (ws, req) => {
       case "candidate": {
         const senderNormId = sockets.get(ws);
         const senderEntry = senderNormId ? peers.get(senderNormId) : null;
-        const fromId = payload.from || (senderEntry ? senderEntry.rawPeerId : senderNormId) || "unknown";
+        const fromRaw = payload.from || msg.from || (senderEntry ? senderEntry.rawPeerId : senderNormId) || "unknown";
+        const fromNorm = normalizePeerId(fromRaw) || senderNormId || fromRaw;
 
-        const targetNormId = normalizePeerId(payload.target);
+        const targetRaw = payload.target || msg.target || "";
+        const targetNormId = normalizePeerId(targetRaw);
         const targetEntry = peers.get(targetNormId);
 
         if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
           sendJson(targetEntry.ws, "candidate", {
-            target: payload.target,
-            from: fromId,
-            candidate: payload.candidate,
+            target: targetNormId,
+            targetId: targetNormId,
+            from: fromNorm,
+            fromId: fromNorm,
+            candidate: payload.candidate || msg.candidate,
           });
         }
         break;
       }
 
       case "ping": {
+        ws.isAlive = true;
         sendJson(ws, "pong", { timestamp: Date.now() });
+        break;
+      }
+
+      case "pong": {
+        ws.isAlive = true;
         break;
       }
 
@@ -249,7 +281,7 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-// Periodic heartbeat keepalive check (every 30 seconds)
+// Periodic heartbeat keepalive check (every 10 seconds)
 const interval = setInterval(() => {
   for (const client of wss.clients) {
     if (client.isAlive === false) {
@@ -260,7 +292,7 @@ const interval = setInterval(() => {
     client.isAlive = false;
     client.ping();
   }
-}, 30000);
+}, 10000);
 
 wss.on("close", () => {
   clearInterval(interval);

@@ -1,6 +1,6 @@
 [package]
 name = "open-remote-gui"
-version = "1.0.16"
+version = "1.0.17"
 description = "High-Performance Cross-Platform Remote Desktop GUI"
 edition = "2021"
 

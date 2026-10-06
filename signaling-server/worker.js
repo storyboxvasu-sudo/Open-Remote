@@ -75,7 +75,7 @@ export class SignalingRoom {
 
   sendJson(ws, action, payload = {}) {
     try {
-      ws.send(JSON.stringify({ action, payload }));
+      ws.send(JSON.stringify({ type: action, action, ...payload, payload }));
     } catch (_e) {}
   }
 
@@ -87,64 +87,100 @@ export class SignalingRoom {
     server.addEventListener("message", (event) => {
       try {
         const msg = JSON.parse(event.data);
-        const action = msg.action;
-        const payload = msg.payload || {};
+        const action = msg.type || msg.action;
+        const payload = msg.payload || msg;
 
         switch (action) {
           case "register": {
-            const rawId = (payload.peer_id || "").trim();
+            const rawId = String(payload.peerId || payload.peer_id || msg.peerId || msg.peer_id || "").trim();
             const normId = this.normalizePeerId(rawId);
-            this.peers.set(normId, { ws: server, rawPeerId: rawId });
+            this.peers.set(normId, { ws: server, rawPeerId: normId });
             this.sockets.set(server, normId);
-            this.sendJson(server, "registered", { peer_id: rawId, success: true, active_peers: this.peers.size });
+            this.sendJson(server, "registered", {
+              peerId: normId,
+              peer_id: normId,
+              success: true,
+              active_peers: this.peers.size,
+              activePeers: this.peers.size,
+            });
+            break;
+          }
+          case "lookup": {
+            const targetRaw = payload.target || msg.target || "";
+            const targetNorm = this.normalizePeerId(targetRaw);
+            const online = this.peers.has(targetNorm);
+            this.sendJson(server, "lookup_result", {
+              target: targetNorm,
+              targetId: targetNorm,
+              online,
+            });
             break;
           }
           case "offer": {
             const senderNorm = this.sockets.get(server);
-            const targetNorm = this.normalizePeerId(payload.target);
+            const fromRaw = payload.from || msg.from || senderNorm || "unknown";
+            const fromNorm = this.normalizePeerId(fromRaw) || senderNorm || fromRaw;
+            const targetRaw = payload.target || msg.target || "";
+            const targetNorm = this.normalizePeerId(targetRaw);
             const targetEntry = this.peers.get(targetNorm);
             if (!targetEntry) {
               this.sendJson(server, "peer_not_found", {
-                target: payload.target,
+                target: targetRaw,
+                targetId: targetNorm,
                 reason: "Partner ID is offline or not registered.",
               });
               return;
             }
             this.sendJson(targetEntry.ws, "offer", {
-              target: payload.target,
-              from: payload.from || senderNorm,
-              sdp: payload.sdp,
+              target: targetNorm,
+              targetId: targetNorm,
+              from: fromNorm,
+              fromId: fromNorm,
+              sdp: payload.sdp || msg.sdp,
             });
             break;
           }
           case "answer": {
             const senderNorm = this.sockets.get(server);
-            const targetNorm = this.normalizePeerId(payload.target);
+            const fromRaw = payload.from || msg.from || senderNorm || "unknown";
+            const fromNorm = this.normalizePeerId(fromRaw) || senderNorm || fromRaw;
+            const targetRaw = payload.target || msg.target || "";
+            const targetNorm = this.normalizePeerId(targetRaw);
             const targetEntry = this.peers.get(targetNorm);
             if (targetEntry) {
               this.sendJson(targetEntry.ws, "answer", {
-                target: payload.target,
-                from: payload.from || senderNorm,
-                sdp: payload.sdp,
+                target: targetNorm,
+                targetId: targetNorm,
+                from: fromNorm,
+                fromId: fromNorm,
+                sdp: payload.sdp || msg.sdp,
               });
             }
             break;
           }
           case "candidate": {
             const senderNorm = this.sockets.get(server);
-            const targetNorm = this.normalizePeerId(payload.target);
+            const fromRaw = payload.from || msg.from || senderNorm || "unknown";
+            const fromNorm = this.normalizePeerId(fromRaw) || senderNorm || fromRaw;
+            const targetRaw = payload.target || msg.target || "";
+            const targetNorm = this.normalizePeerId(targetRaw);
             const targetEntry = this.peers.get(targetNorm);
             if (targetEntry) {
               this.sendJson(targetEntry.ws, "candidate", {
-                target: payload.target,
-                from: payload.from || senderNorm,
-                candidate: payload.candidate,
+                target: targetNorm,
+                targetId: targetNorm,
+                from: fromNorm,
+                fromId: fromNorm,
+                candidate: payload.candidate || msg.candidate,
               });
             }
             break;
           }
           case "ping": {
             this.sendJson(server, "pong", { timestamp: Date.now() });
+            break;
+          }
+          case "pong": {
             break;
           }
         }

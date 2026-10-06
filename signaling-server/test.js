@@ -58,27 +58,28 @@ async function runTests() {
     ]);
     assert(true, "WebSockets connected to server");
 
-    // 3. Register Peer A
+    // 3. Register Peer A with dashes using { type: "register", peerId: "901-432-944" }
     const regPromiseA = new Promise((resolve) => {
       wsA.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.action === "registered") resolve(msg.payload);
+        if (msg.action === "registered" || msg.type === "registered") resolve(msg);
       });
     });
-    wsA.send(JSON.stringify({ action: "register", payload: { peer_id: "901-435-944" } }));
+    wsA.send(JSON.stringify({ type: "register", peerId: "901-432-944" }));
     const regA = await regPromiseA;
-    assert(regA.success === true, "Peer A registered successfully");
+    assert(regA.success === true && regA.peerId === "901432944", "Peer A registered successfully with sanitized numeric ID");
 
     // 4. Dialing Offline Peer: Peer A sends offer to unregistered target "999-888-777"
     const offlinePromise = new Promise((resolve) => {
       wsA.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.action === "peer_not_found") resolve(msg.payload);
+        if (msg.action === "peer_not_found" || msg.type === "peer_not_found") resolve(msg);
       });
     });
     wsA.send(JSON.stringify({
-      action: "offer",
-      payload: { target: "999-888-777", sdp: "dummy_sdp_offer" },
+      type: "offer",
+      target: "999-888-777",
+      sdp: "dummy_sdp_offer",
     }));
     const offlineRes = await offlinePromise;
     assert(
@@ -86,59 +87,67 @@ async function runTests() {
       "Offline target correctly returns 'Partner ID is offline or not registered.'"
     );
 
-    // 5. Register Peer B
+    // 5. Register Peer B without dashes using { action: "register", payload: { peer_id: "925-447-871" } }
     const regPromiseB = new Promise((resolve) => {
       wsB.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.action === "registered") resolve(msg.payload);
+        if (msg.action === "registered" || msg.type === "registered") resolve(msg);
       });
     });
     wsB.send(JSON.stringify({ action: "register", payload: { peer_id: "925-447-871" } }));
     const regB = await regPromiseB;
-    assert(regB.success === true, "Peer B registered successfully");
+    assert(regB.success === true && regB.peerId === "925447871", "Peer B registered successfully with sanitized numeric ID");
 
-    // 6. Offer from Peer A to Peer B
+    // 6. Offer from Peer A to Peer B using plain numeric ID (dashes stripped)
     const offerPromiseB = new Promise((resolve) => {
       wsB.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.action === "offer") resolve(msg.payload);
+        if (msg.action === "offer" || msg.type === "offer") resolve(msg);
       });
     });
+    // Target is "925447871" (no dashes) even though Peer B registered as "925-447-871"
     wsA.send(JSON.stringify({
-      action: "offer",
-      payload: { target: "925-447-871", sdp: "sdp_offer_from_a", from: "901-435-944" },
+      type: "offer",
+      target: "925447871",
+      sdp: "sdp_offer_from_a",
+      from: "901-432-944",
     }));
     const receivedOffer = await offerPromiseB;
-    assert(receivedOffer.sdp === "sdp_offer_from_a", "Offer routed accurately to Peer B");
+    assert(receivedOffer.sdp === "sdp_offer_from_a", "Offer routed accurately to Peer B across dash variations");
 
-    // 7. Answer from Peer B to Peer A
+    // 7. Answer from Peer B to Peer A using dashed ID
     const answerPromiseA = new Promise((resolve) => {
       wsA.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.action === "answer") resolve(msg.payload);
+        if (msg.action === "answer" || msg.type === "answer") resolve(msg);
       });
     });
+    // Target is "901-432-944" (with dashes)
     wsB.send(JSON.stringify({
-      action: "answer",
-      payload: { target: "901-435-944", sdp: "sdp_answer_from_b", from: "925-447-871" },
+      type: "answer",
+      target: "901-432-944",
+      sdp: "sdp_answer_from_b",
+      from: "925447871",
     }));
     const receivedAnswer = await answerPromiseA;
-    assert(receivedAnswer.sdp === "sdp_answer_from_b", "Answer routed accurately to Peer A");
+    assert(receivedAnswer.sdp === "sdp_answer_from_b", "Answer routed accurately to Peer A across dash variations");
 
     // 8. ICE Candidate from Peer A to Peer B
     const candidatePromiseB = new Promise((resolve) => {
       wsB.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.action === "candidate") resolve(msg.payload);
+        if (msg.action === "candidate" || msg.type === "candidate") resolve(msg);
       });
     });
     wsA.send(JSON.stringify({
-      action: "candidate",
-      payload: { target: "925-447-871", candidate: { candidate: "candidate:1 1 UDP..." } },
+      type: "candidate",
+      target: "925-447-871",
+      candidate: { candidate: "candidate:1 1 UDP..." },
     }));
     const receivedCandidate = await candidatePromiseB;
+    const candObj = receivedCandidate.candidate;
     assert(
-      receivedCandidate.candidate.candidate === "candidate:1 1 UDP...",
+      (candObj.candidate || candObj) === "candidate:1 1 UDP...",
       "ICE candidate routed accurately to Peer B"
     );
 
@@ -146,10 +155,10 @@ async function runTests() {
     const pongPromise = new Promise((resolve) => {
       wsA.on("message", (raw) => {
         const msg = JSON.parse(raw.toString());
-        if (msg.action === "pong") resolve(msg.payload);
+        if (msg.action === "pong" || msg.type === "pong") resolve(msg);
       });
     });
-    wsA.send(JSON.stringify({ action: "ping" }));
+    wsA.send(JSON.stringify({ type: "ping" }));
     const pong = await pongPromise;
     assert(typeof pong.timestamp === "number", "Ping/Pong keepalive verified");
 

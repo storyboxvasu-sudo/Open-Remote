@@ -59,7 +59,7 @@ export class SignalingClient {
   }
 
   public start(myPeerId: string) {
-    this.myPeerId = myPeerId;
+    this.myPeerId = (myPeerId || "").replace(/\D/g, "");
     this.isDestroyed = false;
     this.connect();
   }
@@ -78,9 +78,18 @@ export class SignalingClient {
   }
 
   public updatePeerId(peerId: string) {
-    this.myPeerId = peerId;
-    if (this.status === "online" && this.ws?.readyState === WebSocket.OPEN) {
-      this.send("register", { peer_id: peerId });
+    const cleanId = (peerId || "").replace(/\D/g, "");
+    this.myPeerId = cleanId;
+    if (this.status === "online" && this.ws?.readyState === WebSocket.OPEN && cleanId) {
+      this.ws.send(
+        JSON.stringify({
+          type: "register",
+          action: "register",
+          peerId: cleanId,
+          peer_id: cleanId,
+          payload: { peerId: cleanId, peer_id: cleanId },
+        })
+      );
     }
   }
 
@@ -114,16 +123,25 @@ export class SignalingClient {
         console.log(`[signaling] Connected to ${this.url}`);
 
         if (this.myPeerId) {
-          this.send("register", { peer_id: this.myPeerId });
+          const cleanLocalId = this.myPeerId.replace(/\D/g, "");
+          this.ws.send(
+            JSON.stringify({
+              type: "register",
+              action: "register",
+              peerId: cleanLocalId,
+              peer_id: cleanLocalId,
+              payload: { peerId: cleanLocalId, peer_id: cleanLocalId },
+            })
+          );
         }
 
-        // Heartbeat ping every 20s
+        // Heartbeat ping every 10s
         if (this.pingTimer) clearInterval(this.pingTimer);
         this.pingTimer = setInterval(() => {
           if (this.ws?.readyState === WebSocket.OPEN) {
-            this.send("ping", {});
+            this.send("ping", { timestamp: Date.now() });
           }
-        }, 20000);
+        }, 10000);
       };
 
       socket.onmessage = (event) => {
@@ -178,41 +196,57 @@ export class SignalingClient {
 
   public send(action: string, payload: any = {}) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ action, payload }));
+      this.ws.send(
+        JSON.stringify({
+          type: action,
+          action,
+          ...payload,
+          payload,
+        })
+      );
     }
   }
 
-  private handleMessage(msg: SignalingMessage) {
-    const action = msg.action;
-    const payload = msg.payload || {};
+  private handleMessage(msg: any) {
+    const action = msg.type || msg.action;
+    const payload = msg.payload || msg;
 
     switch (action) {
       case "registered":
-        console.log(`[signaling] Registered successfully as ${payload.peer_id}`);
+        const regId = payload.peerId || payload.peer_id || msg.peerId || msg.peer_id;
+        console.log(`[signaling] Registered successfully as ${regId}`);
         this.setStatus("online");
         break;
 
       case "offer":
         if (this.onOffer) {
-          this.onOffer(payload.from, payload.sdp);
+          const from = payload.from || msg.from;
+          const sdp = payload.sdp || msg.sdp;
+          this.onOffer(from, sdp);
         }
         break;
 
       case "answer":
         if (this.onAnswer) {
-          this.onAnswer(payload.from, payload.sdp);
+          const from = payload.from || msg.from;
+          const sdp = payload.sdp || msg.sdp;
+          this.onAnswer(from, sdp);
         }
         break;
 
       case "candidate":
         if (this.onCandidate) {
-          this.onCandidate(payload.from, payload.candidate);
+          const from = payload.from || msg.from;
+          const candidate = payload.candidate || msg.candidate;
+          this.onCandidate(from, candidate);
         }
         break;
 
       case "peer_not_found":
         if (this.onPeerNotFound) {
-          this.onPeerNotFound(payload.target, payload.reason || "Partner ID is offline or not registered.");
+          const target = payload.target || msg.target;
+          const reason = payload.reason || msg.reason || "Partner ID is offline or not registered.";
+          this.onPeerNotFound(target, reason);
         }
         break;
 
@@ -351,7 +385,9 @@ export class WebRTCSession {
   public onDisconnected?: () => void;
   public onError?: (err: any) => void;
 
-  constructor(private signaling: SignalingClient, private myPeerId: string) {}
+  constructor(private signaling: SignalingClient, private myPeerId: string) {
+    this.myPeerId = (myPeerId || "").replace(/\D/g, "");
+  }
 
   public isConnected(): boolean {
     return (
@@ -387,7 +423,10 @@ export class WebRTCSession {
   public async call(targetId: string): Promise<void> {
     this.close();
     this.isCaller = true;
-    this.targetId = targetId;
+    const cleanTargetId = (targetId || "").replace(/\D/g, "");
+    const cleanMyId = (this.myPeerId || "").replace(/\D/g, "");
+    this.targetId = cleanTargetId;
+    this.myPeerId = cleanMyId;
 
     const pc = new RTCPeerConnection(GOOGLE_STUN_CONFIG);
     this.pc = pc;
@@ -460,7 +499,10 @@ export class WebRTCSession {
   public async handleIncomingOffer(fromPeerId: string, sdp: string, hostFeedPort: number): Promise<void> {
     this.close();
     this.isCaller = false;
-    this.targetId = fromPeerId;
+    const cleanFromId = (fromPeerId || "").replace(/\D/g, "");
+    const cleanMyId = (this.myPeerId || "").replace(/\D/g, "");
+    this.targetId = cleanFromId;
+    this.myPeerId = cleanMyId;
 
     const pc = new RTCPeerConnection(GOOGLE_STUN_CONFIG);
     this.pc = pc;
@@ -518,7 +560,7 @@ export class WebRTCSession {
     await pc.setLocalDescription(answer);
 
     this.signaling.send("answer", {
-      target: fromPeerId,
+      target: cleanFromId,
       from: this.myPeerId,
       sdp: answer.sdp,
     });

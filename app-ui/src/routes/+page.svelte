@@ -467,6 +467,7 @@
       signalingClient.stop();
     }
 
+    const cleanLocalId = systemInfo.peer_id.replace(/\D/g, "");
     signalingClient = new SignalingClient(signalingUrl);
     signalingClient.onStatusChange = (status, details) => {
       signalingStatus = status;
@@ -499,7 +500,7 @@
       updateNetworkStatusBadge();
     };
 
-    signalingClient.start(systemInfo.peer_id);
+    signalingClient.start(cleanLocalId);
   }
 
   async function handleIncomingWebRtcOffer(fromPeerId: string, sdp: string) {
@@ -508,7 +509,8 @@
       if (webrtcSession) {
         webrtcSession.close();
       }
-      webrtcSession = new WebRTCSession(signalingClient!, systemInfo?.peer_id || "");
+      const cleanLocalId = (systemInfo?.peer_id || "").replace(/\D/g, "");
+      webrtcSession = new WebRTCSession(signalingClient!, cleanLocalId);
       webrtcSession.onControlMessage = async (msg) => {
         console.log("[webrtc host] Received control msg:", msg);
         if (msg.type === "request_display_switch") {
@@ -684,9 +686,9 @@
   function parseConnectionTarget(input: string): ParsedTarget {
     const raw = input.trim();
     // 1. Check for 9-digit numeric ID: e.g. "901-435-944", "901 435 944", or "901435944"
-    const digitsOnly = raw.replace(/[\s-]/g, "");
-    if (/^\d{9}$/.test(digitsOnly)) {
-      return { kind: "peer_id", raw, normalized: digitsOnly, port: 44321 };
+    const cleanId = raw.replace(/\D/g, "");
+    if (cleanId.length === 9) {
+      return { kind: "peer_id", raw, normalized: cleanId, port: 44321 };
     }
 
     // 2. IPv4 with port: 192.168.1.100:44321
@@ -725,8 +727,8 @@
     if (raw.includes(".") || raw.includes(":")) {
       return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
     }
-    if (/^\d+$/.test(digitsOnly)) {
-      return { kind: "peer_id", raw, normalized: digitsOnly, port: 44321 };
+    if (/^\d+$/.test(cleanId) && cleanId.length > 0) {
+      return { kind: "peer_id", raw, normalized: cleanId, port: 44321 };
     }
     return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
   }
@@ -734,7 +736,7 @@
   async function connectToRemote(passwordToUse?: string) {
     if (!targetAddress.trim() || isConnecting) return;
     const parsed = parseConnectionTarget(targetAddress);
-    const cleanKey = parsed.kind === "peer_id" ? parsed.normalized : parsed.raw;
+    const cleanKey = parsed.kind === "peer_id" ? parsed.normalized.replace(/\D/g, "") : parsed.raw;
 
     // Check saved credentials if no explicit password passed
     if (!passwordToUse) {
@@ -754,10 +756,11 @@
     // =========================================================================
     if (parsed.kind === "peer_id") {
       try {
+        const cleanTargetId = parsed.normalized.replace(/\D/g, "");
         // Invoke backend connect_peer_id command to validate and retrieve config
         const peerInfo: { success: boolean; target_id: string; signaling_url: string; stun_servers: string[] } =
           await invoke("connect_peer_id", {
-            targetId: parsed.normalized,
+            targetId: cleanTargetId,
             password: passwordToUse || null,
           });
 
@@ -771,7 +774,8 @@
           if (webrtcSession) {
             webrtcSession.close();
           }
-          webrtcSession = new WebRTCSession(signalingClient, systemInfo?.peer_id || "");
+          const cleanLocalId = (systemInfo?.peer_id || "").replace(/\D/g, "");
+          webrtcSession = new WebRTCSession(signalingClient, cleanLocalId);
           webrtcSession.onFrameData = (buffer) => {
             handleStreamMessage(buffer);
           };
@@ -783,7 +787,7 @@
             isConnected = true;
             isConnecting = false;
             loadRecentSessions();
-            invoke("save_recent_session", { peerId: parsed.normalized, alias: null }).catch(() => {});
+            invoke("save_recent_session", { peerId: cleanTargetId, alias: null }).catch(() => {});
             updateNetworkStatusBadge();
           };
           webrtcSession.onDisconnected = () => {
@@ -800,7 +804,7 @@
             updateNetworkStatusBadge();
           };
 
-          await webrtcSession.call(parsed.normalized);
+          await webrtcSession.call(cleanTargetId);
 
           // 12-second timeout for WAN signaling
           setTimeout(() => {
@@ -1774,7 +1778,7 @@
         <canvas
           bind:this={canvasRef}
           class="canvas-element"
-          style="transform: translate({panX}px, {panY}px) scale({zoomScale}); transform-origin: center center;"
+          style="transform: translate({panX}px, {panY}px) scale({zoomScale}); transform-origin: center center; cursor: default !important;"
           onmousemove={handleMouseMove}
           onmousedown={handleMouseDown}
           onmouseup={handleMouseUp}
