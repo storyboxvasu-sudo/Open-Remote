@@ -86,8 +86,8 @@
   let copied = $state(false);
 
   // Public Internet Signaling & WebRTC NAT Traversal State
-  let signalingUrl = $state("wss://signaling.openremote.app");
-  let signalingUrlInput = $state("wss://signaling.openremote.app");
+  let signalingUrl = $state("wss://open-remote.onrender.com");
+  let signalingUrlInput = $state("wss://open-remote.onrender.com");
   let signalingStatus = $state<SignalingStatus>("connecting");
   let signalingStatusDetails = $state("");
   let isSavingSignaling = $state(false);
@@ -451,9 +451,13 @@
 
   function updateNetworkStatusBadge() {
     if (isConnecting) {
-      hostStatusMessage = "Connecting to target IP:Port...";
+      hostStatusMessage = "Connecting to partner...";
+    } else if (signalingStatus === "online") {
+      hostStatusMessage = "Online (Cloud Ready)";
+    } else if (signalingStatus === "connecting") {
+      hostStatusMessage = "Connecting to signaling server...";
     } else {
-      hostStatusMessage = "Ready for incoming connections (Direct LAN Active)";
+      hostStatusMessage = isHosting ? "Ready for incoming connections (LAN Active)" : "LAN Direct Mode";
     }
   }
 
@@ -561,6 +565,7 @@
         startHostingAuto();
       }
 
+      initSignalingClient();
       updateNetworkStatusBadge();
     } catch (err) {
       console.error("Failed to fetch system info:", err);
@@ -746,50 +751,129 @@
     authModalError = "";
     pendingAuthTarget = parsed.raw;
 
-    // PURE DIRECT IP / LAN CONNECTION MODE (bypasses signaling, cloud lookups & STUN)
+    // Hybrid connection engine: Cloud Signaling for 9-digit peer IDs, Direct socket for IP:Port
     try {
-      hostStatusMessage = `Connecting directly to ${parsed.normalized}:${parsed.port}...`;
-
-      let res: ClientConnectResult;
       if (parsed.kind === "peer_id") {
-        // Resolve 9-digit peer ID directly across LAN UDP discovery
-        res = await invoke("connect_to_remote", {
-          targetAddress: parsed.raw,
-          password: passwordToUse || null,
-        });
+        const cleanTargetId = parsed.normalized.replace(/\D/g, "");
+        if (signalingClient && (signalingStatus === "online" || signalingStatus === "connecting")) {
+          hostStatusMessage = "Connecting to partner over Cloud (open-remote.onrender.com)...";
+          if (webrtcSession) {
+            webrtcSession.close();
+          }
+          const cleanLocalId = (systemInfo?.peer_id || "").replace(/\D/g, "");
+          webrtcSession = new WebRTCSession(signalingClient, cleanLocalId);
+          webrtcSession.onFrameData = (buffer) => {
+            handleStreamMessage(buffer);
+          };
+          webrtcSession.onControlMessage = (msg) => {
+            handleStreamMessage(JSON.stringify(msg));
+          };
+          webrtcSession.onConnected = () => {
+            console.log("[webrtc] Connected to peer over Cloud WAN");
+            isConnected = true;
+            isConnecting = false;
+            loadRecentSessions();
+            invoke("save_recent_session", { peerId: cleanTargetId, alias: null }).catch(() => {});
+            updateNetworkStatusBadge();
+          };
+          webrtcSession.onDisconnected = () => {
+            console.log("[webrtc] Session disconnected");
+            disconnectRemote();
+          };
+          webrtcSession.onError = (err) => {
+            console.warn("[webrtc] Error:", err);
+            const errStr = typeof err === "string" ? err : (err?.message || "WebRTC connection error");
+            connectionError = errStr.includes("offline") || errStr.includes("not registered")
+              ? "Partner ID is offline or not registered."
+              : errStr;
+            isConnecting = false;
+            updateNetworkStatusBadge();
+          };
+
+          await webrtcSession.call(cleanTargetId);
+
+          // 12-second timeout for WAN signaling
+          setTimeout(() => {
+            if (isConnecting && !isConnected) {
+              if (!connectionError) {
+                connectionError = signalingStatus === "online"
+                  ? "Partner ID is offline or not registered."
+                  : "Connecting to signaling server timed out. Partner is offline.";
+              }
+              isConnecting = false;
+              updateNetworkStatusBadge();
+            }
+          }, 12000);
+          return;
+        } else {
+          // Direct LAN discovery fallback when signaling is offline
+          hostStatusMessage = `Resolving partner ${parsed.raw} on local LAN...`;
+          const res: ClientConnectResult = await invoke("connect_to_remote", {
+            targetAddress: parsed.raw,
+            password: passwordToUse || null,
+          });
+          if (res.requires_password) {
+            isConnecting = false;
+            showAuthModal = true;
+            authPasswordInput = "";
+            authModalError = "";
+            setTimeout(() => {
+              const el = document.getElementById("auth-remote-password-input");
+              if (el) el.focus();
+            }, 50);
+            return;
+          }
+
+          if (res.success) {
+            showAuthModal = false;
+            authPasswordInput = "";
+            authModalError = "";
+            isConnected = true;
+            isConnecting = false;
+            isSubmittingAuth = false;
+            if (res.initial_access_level) {
+              clientAccessLevel = res.initial_access_level;
+            }
+            loadRecentSessions();
+            initStreamWebSocket(res.local_ws_port);
+            return;
+          }
+        }
       } else {
-        // Direct IP:Port connection
-        res = await invoke("connect_direct_ip", {
+        // Direct IP:Port connection (e.g. 20.0.255.179:44321 or 192.168.1.50:44321)
+        hostStatusMessage = `Connecting directly to ${parsed.normalized}:${parsed.port}...`;
+        const res: ClientConnectResult = await invoke("connect_direct_ip", {
           targetIp: parsed.normalized,
           port: parsed.port,
           password: passwordToUse || null,
         });
-      }
 
-      if (res.requires_password) {
-        isConnecting = false;
-        showAuthModal = true;
-        authPasswordInput = "";
-        authModalError = "";
-        setTimeout(() => {
-          const el = document.getElementById("auth-remote-password-input");
-          if (el) el.focus();
-        }, 50);
-        return;
-      }
-
-      if (res.success) {
-        showAuthModal = false;
-        authPasswordInput = "";
-        authModalError = "";
-        isConnected = true;
-        isConnecting = false;
-        isSubmittingAuth = false;
-        if (res.initial_access_level) {
-          clientAccessLevel = res.initial_access_level;
+        if (res.requires_password) {
+          isConnecting = false;
+          showAuthModal = true;
+          authPasswordInput = "";
+          authModalError = "";
+          setTimeout(() => {
+            const el = document.getElementById("auth-remote-password-input");
+            if (el) el.focus();
+          }, 50);
+          return;
         }
-        loadRecentSessions();
-        initStreamWebSocket(res.local_ws_port);
+
+        if (res.success) {
+          showAuthModal = false;
+          authPasswordInput = "";
+          authModalError = "";
+          isConnected = true;
+          isConnecting = false;
+          isSubmittingAuth = false;
+          if (res.initial_access_level) {
+            clientAccessLevel = res.initial_access_level;
+          }
+          loadRecentSessions();
+          initStreamWebSocket(res.local_ws_port);
+          return;
+        }
       }
     } catch (err: any) {
       const errMsg = typeof err === "string" ? err : (err?.message || JSON.stringify(err));
@@ -804,7 +888,9 @@
           if (el) el.focus();
         }, 50);
       } else {
-        connectionError = "Unable to reach IP:Port. Verify IP address and firewall settings.";
+        connectionError = parsed.kind === "direct_ip"
+          ? "Unable to reach IP:Port. Verify IP address and firewall settings."
+          : (errMsg || "Unable to establish connection to partner.");
       }
       isConnecting = false;
       isConnected = false;
@@ -1320,8 +1406,8 @@
   }
 
   function copyAddress() {
-    const directAddr = `${systemInfo?.lan_ip || "127.0.0.1"}:44321`;
-    navigator.clipboard.writeText(directAddr);
+    const toCopy = systemInfo?.peer_id || `${systemInfo?.lan_ip || "127.0.0.1"}:44321`;
+    navigator.clipboard.writeText(toCopy);
     copied = true;
     setTimeout(() => {
       copied = false;
@@ -1833,13 +1919,13 @@
             <div class="desk-card this-desk">
               <div class="card-caption">
                 <span class="section-label">THIS DESK</span>
-                <h2 class="card-heading">Direct LAN Address</h2>
+                <h2 class="card-heading">Your Address</h2>
               </div>
 
               <div class="address-display">
                 <div class="address-digits">
                   {#if systemInfo}
-                    <span class="digits-text">{systemInfo.lan_ip || "127.0.0.1"}:44321</span>
+                    <span class="digits-text">{systemInfo.peer_id}</span>
                   {:else}
                     <span class="digits-placeholder">Initializing...</span>
                   {/if}
@@ -1847,7 +1933,7 @@
                 <button
                   class="btn-copy-address"
                   onclick={copyAddress}
-                  title="Copy Direct LAN Address to Clipboard"
+                  title="Copy 9-digit address to clipboard"
                 >
                   {#if copied}
                     <span class="copy-success">✓ Copied!</span>
@@ -1856,7 +1942,7 @@
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                     </svg>
-                    <span>Copy IP:Port</span>
+                    <span>Copy</span>
                   {/if}
                 </button>
               </div>
@@ -1864,11 +1950,19 @@
               <!-- Listening Status Dot -->
               <div class="status-indicator-row">
                 <span
-                  class="status-dot active"
-                  class:connecting={isConnecting}
+                  class="status-dot"
+                  class:active={signalingStatus === "online" || (signalingStatus === "offline" && isHosting)}
+                  class:connecting={signalingStatus === "connecting" || isConnecting}
+                  class:warning={signalingStatus === "error"}
                 ></span>
                 <span class="status-text">{hostStatusMessage}</span>
-                <span class="cloud-badge lan" title="Operating in direct LAN mode">LAN Active</span>
+                {#if signalingStatus === "online"}
+                  <span class="cloud-badge" title="Public Cloud Signaling connected (wss://open-remote.onrender.com)">Cloud Ready</span>
+                {:else if signalingStatus === "connecting"}
+                  <span class="cloud-badge connecting" title="Connecting to signaling server">Connecting...</span>
+                {:else}
+                  <span class="cloud-badge lan" title="Operating in direct LAN mode">LAN Direct</span>
+                {/if}
               </div>
 
               <div class="desk-footer">
@@ -1904,7 +1998,7 @@
                   <input
                     type="text"
                     class="remote-input"
-                    placeholder="Enter Direct IP:Port (e.g. 20.0.255.179:44321 or 192.168.1.50:44321)"
+                    placeholder="Enter 9-Digit ID or IP:Port (e.g. 901-435-944 or 192.168.1.50:44321)"
                     bind:value={targetAddress}
                     onkeypress={handleKeypressConnect}
                   />
@@ -2243,38 +2337,70 @@
               </div>
             </div>
 
-            <!-- Direct LAN Mode Card -->
+            <!-- Public Cloud Signaling & NAT Traversal Card -->
             <div class="engine-section-card">
               <div class="card-caption">
-                <span class="section-label">DIRECT LAN ENGINE</span>
-                <h2 class="card-heading">Local Network & Direct IP Mode</h2>
+                <span class="section-label">PUBLIC CLOUD SIGNALING</span>
+                <h2 class="card-heading">Internet Rendezvous & NAT Traversal</h2>
               </div>
               <div class="signaling-card-content">
-                <div class="signaling-status-banner online">
-                  <span class="status-dot active"></span>
+                <div
+                  class="signaling-status-banner"
+                  class:online={signalingStatus === "online"}
+                  class:connecting={signalingStatus === "connecting"}
+                  class:error={signalingStatus === "error" || signalingStatus === "offline"}
+                >
+                  <span
+                    class="status-dot"
+                    class:active={signalingStatus === "online"}
+                    class:connecting={signalingStatus === "connecting"}
+                    class:warning={signalingStatus === "error" || signalingStatus === "offline"}
+                  ></span>
                   <div class="banner-text">
                     <span class="banner-title">
-                      Direct LAN Mode Active
+                      {#if signalingStatus === "online"}
+                        Connected & Ready (Cloud WAN Mode)
+                      {:else if signalingStatus === "connecting"}
+                        Connecting to Signaling Relay...
+                      {:else}
+                        Signaling Disconnected (LAN Only Fallback)
+                      {/if}
                     </span>
                     <span class="banner-sub">
-                      Connections occur directly over the local network via TCP/UDP on port 44321 without requiring an external rendezvous server.
+                      {#if signalingStatus === "online"}
+                        STUN NAT Traversal active via Google Public STUN. You can dial and receive connections across different Wi-Fi networks and mobile hotspots.
+                      {:else}
+                        {signalingStatusDetails || "Remote 9-digit connections require signaling. Check network or verify signaling server URL."}
+                      {/if}
                     </span>
                   </div>
                 </div>
 
                 <div class="signaling-url-config">
-                  <label class="url-label" for="signaling-url-field">Direct Host Binding:</label>
+                  <label class="url-label" for="signaling-url-field">Signaling Server Endpoint (WebSocket):</label>
                   <div class="url-input-row">
                     <input
                       id="signaling-url-field"
                       type="text"
                       class="url-input"
-                      readonly
-                      value="0.0.0.0:44321 (LAN: {systemInfo?.lan_ip || '127.0.0.1'}:44321)"
+                      placeholder="wss://open-remote.onrender.com"
+                      bind:value={signalingUrlInput}
                     />
+                    <button
+                      class="btn-save-signaling"
+                      disabled={isSavingSignaling || !signalingUrlInput.trim()}
+                      onclick={saveSignalingUrl}
+                    >
+                      {#if isSavingSignaling}
+                        <span class="btn-spinner"></span>
+                        <span>Saving...</span>
+                      {:else}
+                        <span>Save & Reconnect</span>
+                      {/if}
+                    </button>
                   </div>
                   <p class="url-hint">
-                    Host listener binds to all local interfaces on port 44321 (TCP video stream & UDP control/input).
+                    Default: <code>wss://open-remote.onrender.com</code>. Fallback: Direct LAN TCP/UDP on port 44321 ({systemInfo?.lan_ip || "127.0.0.1"}:44321).
                   </p>
                 </div>
               </div>
@@ -2341,9 +2467,9 @@
             <span class="engine-tech">Native SendInput</span>
           </div>
           <div class="engine-item">
-            <span class="engine-bullet" style="color: #22c55e;">●</span>
+            <span class="engine-bullet" style="color: {signalingStatus === 'online' ? '#22c55e' : '#f59e0b'};">●</span>
             <span class="engine-name">Network:</span>
-            <span class="engine-tech">LAN Direct (44321)</span>
+            <span class="engine-tech">{signalingStatus === 'online' ? 'Cloud Signaling (open-remote.onrender.com)' : 'LAN Direct (44321)'}</span>
           </div>
         </div>
       </div>
@@ -3165,6 +3291,11 @@
     animation: status-pulse 1.4s ease-in-out infinite;
   }
 
+  .status-dot.warning {
+    background: #f59e0b;
+    box-shadow: 0 0 8px #f59e0b;
+  }
+
   @keyframes status-pulse {
     0%, 100% {
       opacity: 1;
@@ -3189,6 +3320,12 @@
     letter-spacing: 0.5px;
     display: inline-flex;
     align-items: center;
+  }
+
+  .cloud-badge.connecting {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.3);
   }
 
   .cloud-badge.lan {
@@ -4118,6 +4255,14 @@
     background: rgba(34, 197, 94, 0.08);
     border-color: rgba(34, 197, 94, 0.25);
   }
+  .signaling-status-banner.connecting {
+    background: rgba(59, 130, 246, 0.08);
+    border-color: rgba(59, 130, 246, 0.25);
+  }
+  .signaling-status-banner.error {
+    background: rgba(245, 158, 11, 0.08);
+    border-color: rgba(245, 158, 11, 0.25);
+  }
   .banner-text {
     display: flex;
     flex-direction: column;
@@ -4163,10 +4308,38 @@
   .url-input:focus {
     border-color: #38bdf8;
   }
+  .btn-save-signaling {
+    background: #0284c7;
+    border: 1px solid #38bdf8;
+    color: #fff;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s ease;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-save-signaling:hover:not(:disabled) {
+    background: #0369a1;
+  }
+  .btn-save-signaling:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
   .url-hint {
     font-size: 0.74rem;
     color: #64748b;
     margin: 0;
+  }
+  .url-hint code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 2px 5px;
+    border-radius: 4px;
+    color: #94a3b8;
   }
 
   /* Modal Backdrop & Card */

@@ -43,7 +43,7 @@ export class SignalingClient {
   public onCandidate?: (from: string, candidate: any) => void;
   public onPeerNotFound?: (target: string, reason: string) => void;
 
-  constructor(defaultUrl: string = "wss://signaling.openremote.app") {
+  constructor(defaultUrl: string = "wss://open-remote.onrender.com") {
     this.url = defaultUrl;
   }
 

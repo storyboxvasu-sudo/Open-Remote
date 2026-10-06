@@ -334,7 +334,7 @@ async fn get_system_info(state: State<'_, AppEngineState>) -> Result<SystemInfo,
     drop(host_guard);
 
     let cfg = PeerConfig::load();
-    let signaling_url = Some(cfg.signaling_server.unwrap_or_else(|| "wss://signaling.openremote.app".to_string()));
+    let signaling_url = Some(cfg.signaling_server.unwrap_or_else(|| "wss://open-remote.onrender.com".to_string()));
 
     Ok(SystemInfo {
         peer_id: state.peer_id.clone(),
@@ -867,20 +867,20 @@ async fn verify_webrtc_auth(
 #[tauri::command]
 fn get_signaling_url() -> String {
     let cfg = PeerConfig::load();
-    cfg.signaling_server.unwrap_or_else(|| "wss://signaling.openremote.app".to_string())
+    cfg.signaling_server.unwrap_or_else(|| "wss://open-remote.onrender.com".to_string())
 }
 
 #[tauri::command]
 fn set_signaling_url(url: String) -> Result<String, String> {
     let mut cfg = PeerConfig::load();
     let trimmed = url.trim().to_string();
-    if trimmed.is_empty() || trimmed == "wss://signaling.openremote.app" {
+    if trimmed.is_empty() || trimmed == "wss://open-remote.onrender.com" {
         cfg.signaling_server = None;
     } else {
         cfg.signaling_server = Some(trimmed);
     }
     cfg.save().map_err(|e| format!("Failed to save config: {}", e))?;
-    Ok(cfg.signaling_server.unwrap_or_else(|| "wss://signaling.openremote.app".to_string()))
+    Ok(cfg.signaling_server.unwrap_or_else(|| "wss://open-remote.onrender.com".to_string()))
 }
 
 #[tauri::command]
