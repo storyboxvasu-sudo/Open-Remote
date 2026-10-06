@@ -3506,13 +3506,22 @@
     justify-content: center;
     background: #000000;
     outline: none;
+    cursor: default !important;
   }
 
   .canvas-element {
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
-    cursor: crosshair;
+    cursor: default !important;
+  }
+
+  .canvas-element:active,
+  .canvas-element:hover,
+  .canvas-element:focus,
+  .remote-viewport:active,
+  .remote-viewport:hover {
+    cursor: default !important;
   }
 
   .session-hud {
