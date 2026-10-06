@@ -206,12 +206,13 @@
     }
 
     try {
-      // 10-second timeout guarantee so checking never hangs indefinitely
+      // 20-second safety timeout so checking never hangs indefinitely
       const timeoutPromise = new Promise<null>((_, reject) =>
-        setTimeout(() => reject(new Error("Update check request timed out")), 10000)
+        setTimeout(() => reject(new Error("Update check request timed out")), 20000)
       );
 
-      const update = await Promise.race([check(), timeoutPromise]);
+      // Explicit 15-second HTTP request timeout for Tauri v2 updater client
+      const update = await Promise.race([check({ timeout: 15000 }), timeoutPromise]);
       if (update) {
         availableUpdate = update;
         showUpdateModal = true;
@@ -2376,32 +2377,19 @@
                   </div>
                 </div>
 
-                <div class="signaling-url-config">
-                  <label class="url-label" for="signaling-url-field">Signaling Server Endpoint (WebSocket):</label>
-                  <div class="url-input-row">
-                    <input
-                      id="signaling-url-field"
-                      type="text"
-                      class="url-input"
-                      placeholder="wss://open-remote.onrender.com"
-                      bind:value={signalingUrlInput}
-                    />
-                    <button
-                      class="btn-save-signaling"
-                      disabled={isSavingSignaling || !signalingUrlInput.trim()}
-                      onclick={saveSignalingUrl}
-                    >
-                      {#if isSavingSignaling}
-                        <span class="btn-spinner"></span>
-                        <span>Saving...</span>
-                      {:else}
-                        <span>Save & Reconnect</span>
-                      {/if}
-                    </button>
+                <div class="network-details-grid">
+                  <div class="network-detail-item">
+                    <span class="detail-label">Network Architecture:</span>
+                    <span class="detail-val highlight">Zero-Config Cloud Mesh (AnyDesk-style)</span>
                   </div>
-                  <p class="url-hint">
-                    Default: <code>wss://open-remote.onrender.com</code>. Fallback: Direct LAN TCP/UDP on port 44321 ({systemInfo?.lan_ip || "127.0.0.1"}:44321).
-                  </p>
+                  <div class="network-detail-item">
+                    <span class="detail-label">Direct LAN Address:</span>
+                    <span class="detail-val">{systemInfo?.lan_ip || "127.0.0.1"}:44321</span>
+                  </div>
+                  <div class="network-detail-item">
+                    <span class="detail-label">NAT Traversal:</span>
+                    <span class="detail-val">Google STUN (Autonomous WAN Traversal)</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -4278,68 +4266,33 @@
     color: #94a3b8;
     line-height: 1.4;
   }
-  .signaling-url-config {
+  .network-details-grid {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-  }
-  .url-label {
-    font-size: 0.8rem;
-    font-weight: 500;
-    color: #94a3b8;
-  }
-  .url-input-row {
-    display: flex;
     gap: 10px;
-    align-items: center;
+    background: rgba(15, 23, 42, 0.4);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    padding: 14px 16px;
   }
-  .url-input {
-    flex: 1;
-    background: rgba(15, 23, 42, 0.8);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 6px;
-    padding: 8px 12px;
-    color: #f1f5f9;
-    font-size: 0.82rem;
-    font-family: monospace;
-    outline: none;
-    transition: border-color 0.15s ease;
-  }
-  .url-input:focus {
-    border-color: #38bdf8;
-  }
-  .btn-save-signaling {
-    background: #0284c7;
-    border: 1px solid #38bdf8;
-    color: #fff;
-    padding: 8px 16px;
-    border-radius: 6px;
-    font-size: 0.8rem;
-    font-weight: 600;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: all 0.15s ease;
+  .network-detail-item {
     display: flex;
+    justify-content: space-between;
     align-items: center;
-    gap: 6px;
+    font-size: 0.8rem;
   }
-  .btn-save-signaling:hover:not(:disabled) {
-    background: #0369a1;
-  }
-  .btn-save-signaling:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-  .url-hint {
-    font-size: 0.74rem;
-    color: #64748b;
-    margin: 0;
-  }
-  .url-hint code {
-    background: rgba(255, 255, 255, 0.06);
-    padding: 2px 5px;
-    border-radius: 4px;
+  .detail-label {
     color: #94a3b8;
+  }
+  .detail-val {
+    color: #e2e8f0;
+    font-family: monospace;
+    font-weight: 500;
+  }
+  .detail-val.highlight {
+    color: #38bdf8;
+    font-family: inherit;
+    font-weight: 600;
   }
 
   /* Modal Backdrop & Card */

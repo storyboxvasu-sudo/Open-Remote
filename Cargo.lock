@@ -2813,7 +2813,7 @@ dependencies = [
 
 [[package]]
 name = "open-remote-gui"
-version = "1.0.19"
+version = "1.0.20"
 dependencies = [
  "app-common",
  "base64 0.22.1",

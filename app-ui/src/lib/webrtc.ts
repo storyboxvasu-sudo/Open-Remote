@@ -43,7 +43,9 @@ export class SignalingClient {
   public onCandidate?: (from: string, candidate: any) => void;
   public onPeerNotFound?: (target: string, reason: string) => void;
 
-  constructor(defaultUrl: string = "wss://open-remote.onrender.com") {
+  public static readonly DEFAULT_URL = "wss://open-remote.onrender.com";
+
+  constructor(defaultUrl: string = SignalingClient.DEFAULT_URL) {
     this.url = defaultUrl;
   }
 
@@ -135,13 +137,13 @@ export class SignalingClient {
           );
         }
 
-        // Heartbeat ping every 10s
+        // Heartbeat ping every 15s
         if (this.pingTimer) clearInterval(this.pingTimer);
         this.pingTimer = setInterval(() => {
           if (this.ws?.readyState === WebSocket.OPEN) {
             this.send("ping", { timestamp: Date.now() });
           }
-        }, 10000);
+        }, 15000);
       };
 
       socket.onmessage = (event) => {
