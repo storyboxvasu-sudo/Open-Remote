@@ -17,8 +17,13 @@ const GOOGLE_STUN_CONFIG: RTCConfiguration = {
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
   ],
-  iceCandidatePoolSize: 4,
+  iceCandidatePoolSize: 10,
+  iceTransportPolicy: "all",
+  bundlePolicy: "max-bundle",
+  rtcpMuxPolicy: "require",
 };
 
 // Chunking constants for RTCDataChannel safety across WAN

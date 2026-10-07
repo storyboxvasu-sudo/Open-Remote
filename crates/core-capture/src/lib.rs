@@ -493,6 +493,13 @@ pub mod macos_capture {
         pub fn CGDisplayPixelsWide(display: CGDirectDisplayID) -> usize;
         pub fn CGDisplayPixelsHigh(display: CGDirectDisplayID) -> usize;
         pub fn CGDisplayCreateImage(display: CGDirectDisplayID) -> CGImageRef;
+        pub fn CGGetOnlineDisplayList(
+            max_displays: u32,
+            online_displays: *mut CGDirectDisplayID,
+            display_count: *mut u32,
+        ) -> CGError;
+        pub fn CGPreflightScreenCaptureAccess() -> bool;
+        pub fn CGRequestScreenCaptureAccess() -> bool;
         pub fn CGImageRelease(image: CGImageRef);
         pub fn CGImageGetWidth(image: CGImageRef) -> usize;
         pub fn CGImageGetHeight(image: CGImageRef) -> usize;
@@ -507,29 +514,48 @@ pub mod macos_capture {
         pub fn CFRelease(cf: CFTypeRef);
     }
 
+    pub fn ensure_screen_capture_permission() -> bool {
+        unsafe {
+            if CGPreflightScreenCaptureAccess() {
+                true
+            } else {
+                CGRequestScreenCaptureAccess()
+            }
+        }
+    }
+
     pub fn enumerate_monitors_macos() -> Vec<MonitorDescriptor> {
+        let _ = ensure_screen_capture_permission();
+
         let mut displays = [0u32; 16];
         let mut display_count = 0u32;
-        let err = unsafe {
+        let mut err = unsafe {
             CGGetActiveDisplayList(16, displays.as_mut_ptr(), &mut display_count)
         };
+
+        if err != 0 || display_count == 0 {
+            err = unsafe {
+                CGGetOnlineDisplayList(16, displays.as_mut_ptr(), &mut display_count)
+            };
+        }
+
         let main_id = unsafe { CGMainDisplayID() };
         let mut list = Vec::new();
 
-        if err == 0 && display_count > 0 {
+        if (err == 0 || display_count > 0) && display_count > 0 {
             for i in 0..(display_count as usize) {
                 let d_id = displays[i];
                 let bounds = unsafe { CGDisplayBounds(d_id) };
-                let width = if bounds.size.width > 0.0 {
-                    bounds.size.width as u32
-                } else {
-                    unsafe { CGDisplayPixelsWide(d_id) as u32 }
-                };
-                let height = if bounds.size.height > 0.0 {
-                    bounds.size.height as u32
-                } else {
-                    unsafe { CGDisplayPixelsHigh(d_id) as u32 }
-                };
+
+                // On Retina displays, CGDisplayPixelsWide/High returns physical pixels
+                let pixel_w = unsafe { CGDisplayPixelsWide(d_id) as u32 };
+                let pixel_h = unsafe { CGDisplayPixelsHigh(d_id) as u32 };
+                let bounds_w = if bounds.size.width > 0.0 { bounds.size.width as u32 } else { 0 };
+                let bounds_h = if bounds.size.height > 0.0 { bounds.size.height as u32 } else { 0 };
+
+                let width = pixel_w.max(bounds_w).max(640);
+                let height = pixel_h.max(bounds_h).max(480);
+
                 let is_primary = d_id == main_id;
                 let index = i;
                 let name = if is_primary {
@@ -541,13 +567,35 @@ pub mod macos_capture {
                 list.push(MonitorDescriptor {
                     index,
                     name,
-                    width: width.max(640),
-                    height: height.max(480),
+                    width,
+                    height,
                     is_primary,
                     x: bounds.origin.x as i32,
                     y: bounds.origin.y as i32,
                 });
             }
+        }
+
+        // If display list was empty, attempt querying main display directly
+        if list.is_empty() && main_id != 0 {
+            let bounds = unsafe { CGDisplayBounds(main_id) };
+            let pixel_w = unsafe { CGDisplayPixelsWide(main_id) as u32 };
+            let pixel_h = unsafe { CGDisplayPixelsHigh(main_id) as u32 };
+            let bounds_w = if bounds.size.width > 0.0 { bounds.size.width as u32 } else { 0 };
+            let bounds_h = if bounds.size.height > 0.0 { bounds.size.height as u32 } else { 0 };
+
+            let width = pixel_w.max(bounds_w).max(1280);
+            let height = pixel_h.max(bounds_h).max(800);
+
+            list.push(MonitorDescriptor {
+                index: 0,
+                name: "Display 1 (Primary)".to_string(),
+                width,
+                height,
+                is_primary: true,
+                x: bounds.origin.x as i32,
+                y: bounds.origin.y as i32,
+            });
         }
 
         if list.is_empty() {
@@ -703,6 +751,17 @@ impl ScreenCapturer {
                 x: 0,
                 y: 0,
             }]
+        }
+    }
+
+    pub fn request_screen_capture_permission() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            macos_capture::ensure_screen_capture_permission()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
         }
     }
 

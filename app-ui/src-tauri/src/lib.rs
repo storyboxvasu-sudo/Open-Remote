@@ -1213,6 +1213,11 @@ fn ensure_firewall_rules() {
     });
 }
 
+#[tauri::command]
+fn request_screen_capture_permission() -> bool {
+    core_capture::ScreenCapturer::request_screen_capture_permission()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = AppEngineState::new();
@@ -1227,6 +1232,10 @@ pub fn run() {
             {
                 cleanup_orphaned_instances();
                 ensure_firewall_rules();
+            }
+            #[cfg(target_os = "macos")]
+            {
+                core_capture::ScreenCapturer::request_screen_capture_permission();
             }
 
             // Automatically and persistently start host listening server & discovery on boot via internal_start_hosting
@@ -1366,7 +1375,8 @@ pub fn run() {
             app_close,
             app_exit_completely,
             app_relaunch,
-            app_start_dragging
+            app_start_dragging,
+            request_screen_capture_permission
         ])
         .run(tauri::generate_context!())
         .expect("error while running OpenRemote desktop application");

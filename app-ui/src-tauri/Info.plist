@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>OpenRemote requires screen capture permission to stream your desktop displays to connected remote clients.</string>
+    <string>OpenRemote requires screen recording permissions to capture and stream the remote display.</string>
     <key>NSAccessibilityUsageDescription</key>
     <string>OpenRemote requires accessibility permission to control the mouse and keyboard remotely.</string>
     <key>NSHighResolutionCapable</key>

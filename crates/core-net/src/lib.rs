@@ -1051,9 +1051,14 @@ impl DirectLanClient {
     ) -> Result<(TcpStream, AccessLevel), NetError> {
         let primary_addr = self.target_addr;
         let alt_addr = SocketAddr::new(self.target_addr.ip(), self.target_addr.port() + 1);
-        let mut stream = match tokio::time::timeout(tokio::time::Duration::from_millis(2000), TcpStream::connect(primary_addr)).await {
+        let mut stream = match tokio::time::timeout(tokio::time::Duration::from_secs(10), TcpStream::connect(primary_addr)).await {
             Ok(Ok(s)) => s,
-            _ => TcpStream::connect(alt_addr).await?,
+            _ => {
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), TcpStream::connect(alt_addr))
+                    .await
+                    .map_err(|_| NetError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Direct connection attempt timed out after 10 seconds")))?
+                    ?
+            }
         };
         let _ = stream.set_nodelay(true);
 
@@ -1153,9 +1158,14 @@ impl DirectLanClient {
     {
         let primary_addr = self.target_addr;
         let alt_addr = SocketAddr::new(self.target_addr.ip(), self.target_addr.port() + 1);
-        let mut stream = match tokio::time::timeout(tokio::time::Duration::from_millis(2000), TcpStream::connect(primary_addr)).await {
+        let mut stream = match tokio::time::timeout(tokio::time::Duration::from_secs(10), TcpStream::connect(primary_addr)).await {
             Ok(Ok(s)) => s,
-            _ => TcpStream::connect(alt_addr).await?,
+            _ => {
+                tokio::time::timeout(tokio::time::Duration::from_secs(10), TcpStream::connect(alt_addr))
+                    .await
+                    .map_err(|_| NetError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Direct connection attempt timed out after 10 seconds")))?
+                    ?
+            }
         };
         let _ = stream.set_nodelay(true);
 

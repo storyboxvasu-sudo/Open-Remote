@@ -18,7 +18,7 @@ const artifactFilename = args[2];
 const repo = args[3] || process.env.GITHUB_REPOSITORY || 'storyboxvasu-sudo/Open-Remote';
 
 // Read exact version from tauri.conf.json to guarantee the signature matches the announced version
-let tauriVersion = '1.0.22';
+let tauriVersion = '1.0.23';
 try {
   const confPath = path.resolve(__dirname, '../app-ui/src-tauri/tauri.conf.json');
   if (fs.existsSync(confPath)) {

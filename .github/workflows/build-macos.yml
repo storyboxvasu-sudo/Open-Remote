@@ -183,6 +183,10 @@ jobs:
             echo "Updater archive: artifacts/${{ matrix.tar_name }}"
             echo "Updater signature: artifacts/${{ matrix.tar_name }}.sig"
 
+            # Also provide standard OpenRemote.app.tar.gz and OpenRemote.app.tar.gz.sig
+            cp "$TAR_FILE" "artifacts/OpenRemote.app.tar.gz"
+            cp "$SIG_FILE" "artifacts/OpenRemote.app.tar.gz.sig"
+
             # 3. Generate / Update latest.json
             node scripts/update-latest-json.js \
               "${{ matrix.platform_key }}" \
