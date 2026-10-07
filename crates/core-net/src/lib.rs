@@ -322,6 +322,7 @@ impl DirectLanHost {
             .parse()
             .map_err(|e: std::net::AddrParseError| NetError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
         let socket = bind_udp_reuse(addr).await?;
+        eprintln!("[core-net host] Direct UDP input listener explicitly bound to 0.0.0.0:{}", self.control_port);
         let injector = Arc::clone(&self.injector);
         let capturer = Arc::clone(&self.capturer);
         let access_level = Arc::clone(&self.access_level);
@@ -346,32 +347,91 @@ impl DirectLanHost {
 
     /// Starts the video streaming TCP listener, broadcasting compressed desktop frames to connected viewers
     pub async fn start_video_stream(&self) -> Result<(), NetError> {
-        let addr: SocketAddr = format!("0.0.0.0:{}", self.video_port)
-            .parse()
-            .map_err(|e: std::net::AddrParseError| NetError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-        let listener = bind_tcp_reuse(addr).await?;
-        let capturer = Arc::clone(&self.capturer);
-        let prompt_callback = Arc::clone(&self.prompt_callback);
-        let access_level = Arc::clone(&self.access_level);
-        let default_access_level = Arc::clone(&self.default_access_level);
-        let unattended_access = Arc::clone(&self.unattended_access);
-        let active_client = Arc::clone(&self.active_client);
+        let ports = if self.control_port != self.video_port {
+            vec![self.video_port, self.control_port]
+        } else {
+            vec![self.video_port]
+        };
 
-        let handle = tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, peer_addr)) = listener.accept().await {
-                    let _ = stream.set_nodelay(true);
-                    let cap = Arc::clone(&capturer);
-                    let cb_opt = prompt_callback.lock().clone();
-                    let access_lvl_clone = Arc::clone(&access_level);
-                    let def_access_lvl = *default_access_level.read();
-                    let unattended_cfg_lock = Arc::clone(&unattended_access);
-                    let active_client_clone = Arc::clone(&active_client);
-                    let enc = FrameEncoder::new();
+        let mut listeners = Vec::new();
+        for port in ports {
+            let addr: SocketAddr = format!("0.0.0.0:{}", port)
+                .parse()
+                .map_err(|e: std::net::AddrParseError| NetError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+            match bind_tcp_reuse(addr).await {
+                Ok(listener) => {
+                    eprintln!("[core-net host] Video stream TCP listener explicitly bound to 0.0.0.0:{}", port);
+                    listeners.push(listener);
+                }
+                Err(e) => {
+                    eprintln!("[core-net host] Warning: could not bind TCP on 0.0.0.0:{}: {:?}", port, e);
+                }
+            }
+        }
 
-                    tokio::spawn(async move {
-                        // 1. Read Client Handshake Request
-                        let mut req_len_buf = [0u8; 4];
+        if listeners.is_empty() {
+            return Err(NetError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "Failed to bind video stream TCP listeners on configured ports",
+            )));
+        }
+
+        for listener in listeners {
+            let capturer = Arc::clone(&self.capturer);
+            let prompt_callback = Arc::clone(&self.prompt_callback);
+            let access_level = Arc::clone(&self.access_level);
+            let default_access_level = Arc::clone(&self.default_access_level);
+            let unattended_access = Arc::clone(&self.unattended_access);
+            let active_client = Arc::clone(&self.active_client);
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    if let Ok((stream, peer_addr)) = listener.accept().await {
+                        eprintln!("[core-net host] Accepted incoming TCP connection from remote peer: {}", peer_addr);
+                        let _ = stream.set_nodelay(true);
+                        let cap = Arc::clone(&capturer);
+                        let cb_opt = prompt_callback.lock().clone();
+                        let access_lvl_clone = Arc::clone(&access_level);
+                        let def_access_lvl = *default_access_level.read();
+                        let unattended_cfg_lock = Arc::clone(&unattended_access);
+                        let active_client_clone = Arc::clone(&active_client);
+
+                        tokio::spawn(async move {
+                            Self::handle_video_client_stream(
+                                stream,
+                                peer_addr,
+                                cap,
+                                cb_opt,
+                                access_lvl_clone,
+                                def_access_lvl,
+                                unattended_cfg_lock,
+                                active_client_clone,
+                            ).await;
+                        });
+                    }
+                }
+            });
+
+            self.tasks.lock().push(handle);
+        }
+
+        Ok(())
+    }
+
+    async fn handle_video_client_stream(
+        mut stream: TcpStream,
+        peer_addr: SocketAddr,
+        cap: Arc<ScreenCapturer>,
+        cb_opt: Option<RequestPromptCallback>,
+        access_lvl_clone: Arc<parking_lot::RwLock<AccessLevel>>,
+        def_access_lvl: AccessLevel,
+        unattended_cfg_lock: Arc<parking_lot::RwLock<UnattendedAccessConfig>>,
+        active_client_clone: Arc<parking_lot::RwLock<Option<(String, String)>>>,
+    ) {
+        let enc = FrameEncoder::new();
+
+        // 1. Read Client Handshake Request
+        let mut req_len_buf = [0u8; 4];
                         if tokio::time::timeout(tokio::time::Duration::from_secs(10), stream.read_exact(&mut req_len_buf)).await.is_err() {
                             return;
                         }
@@ -738,13 +798,6 @@ impl DirectLanHost {
                         }
 
                         *active_client_clone.write() = None;
-                    });
-                }
-            }
-        });
-
-        self.tasks.lock().push(handle);
-        Ok(())
     }
 
     /// Starts the background UDP discovery responder and continuous beacon
@@ -996,8 +1049,12 @@ impl DirectLanClient {
         &self,
         password: Option<String>,
     ) -> Result<(TcpStream, AccessLevel), NetError> {
-        let video_addr = SocketAddr::new(self.target_addr.ip(), self.target_addr.port() + 1);
-        let mut stream = TcpStream::connect(video_addr).await?;
+        let primary_addr = self.target_addr;
+        let alt_addr = SocketAddr::new(self.target_addr.ip(), self.target_addr.port() + 1);
+        let mut stream = match tokio::time::timeout(tokio::time::Duration::from_millis(2000), TcpStream::connect(primary_addr)).await {
+            Ok(Ok(s)) => s,
+            _ => TcpStream::connect(alt_addr).await?,
+        };
         let _ = stream.set_nodelay(true);
 
         // Send initial Handshake Request
@@ -1094,8 +1151,12 @@ impl DirectLanClient {
         F: FnOnce(AuthChallenge) -> Fut,
         Fut: std::future::Future<Output = Option<String>>,
     {
-        let video_addr = SocketAddr::new(self.target_addr.ip(), self.target_addr.port() + 1);
-        let mut stream = TcpStream::connect(video_addr).await?;
+        let primary_addr = self.target_addr;
+        let alt_addr = SocketAddr::new(self.target_addr.ip(), self.target_addr.port() + 1);
+        let mut stream = match tokio::time::timeout(tokio::time::Duration::from_millis(2000), TcpStream::connect(primary_addr)).await {
+            Ok(Ok(s)) => s,
+            _ => TcpStream::connect(alt_addr).await?,
+        };
         let _ = stream.set_nodelay(true);
 
         // Send initial Handshake Request

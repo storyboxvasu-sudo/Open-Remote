@@ -1145,14 +1145,55 @@ fn ensure_firewall_rules() {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    // Add Windows Firewall rules silently for ports 44320 & 44321
     std::thread::spawn(|| {
         let rules = [
+            ("OpenRemote Stream TCP", "TCP", "44321,44322"),
+            ("OpenRemote Stream UDP", "UDP", "44321"),
             ("OpenRemote LAN Discovery", "UDP", "44320"),
-            ("OpenRemote Control & Video", "TCP", "44321,44322"),
-            ("OpenRemote Control UDP", "UDP", "44321"),
         ];
+
         for (name, protocol, port) in rules {
+            // Check if rule already exists to avoid redundant executions
+            let check_output = std::process::Command::new("netsh")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["advfirewall", "firewall", "show", "rule", &format!("name={}", name)])
+                .output();
+
+            let exists = check_output.map(|o| o.status.success()).unwrap_or(false);
+            if !exists {
+                let netsh_res = std::process::Command::new("netsh")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .args([
+                        "advfirewall",
+                        "firewall",
+                        "add",
+                        "rule",
+                        &format!("name={}", name),
+                        "dir=in",
+                        "action=allow",
+                        &format!("protocol={}", protocol),
+                        &format!("localport={}", port),
+                        "profile=any",
+                    ])
+                    .output();
+
+                // If netsh fails or needs elevation, attempt PowerShell New-NetFirewallRule
+                if netsh_res.is_err() || !netsh_res.as_ref().unwrap().status.success() {
+                    let ps_script = format!(
+                        "New-NetFirewallRule -DisplayName '{}' -Direction Inbound -Action Allow -Protocol {} -LocalPort {} -Profile Any -ErrorAction SilentlyContinue",
+                        name, protocol, port
+                    );
+                    let _ = std::process::Command::new("powershell")
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
+                        .output();
+                }
+            }
+        }
+
+        // Also ensure application executable rule is allowed
+        if let Ok(exe_path) = std::env::current_exe() {
+            let exe_str = exe_path.to_string_lossy();
             let _ = std::process::Command::new("netsh")
                 .creation_flags(CREATE_NO_WINDOW)
                 .args([
@@ -1160,11 +1201,11 @@ fn ensure_firewall_rules() {
                     "firewall",
                     "add",
                     "rule",
-                    &format!("name={}", name),
+                    "name=OpenRemote Application",
                     "dir=in",
                     "action=allow",
-                    &format!("protocol={}", protocol),
-                    &format!("localport={}", port),
+                    &format!("program={}", exe_str),
+                    "enable=yes",
                     "profile=any",
                 ])
                 .output();
