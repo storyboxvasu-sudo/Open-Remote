@@ -206,13 +206,13 @@
     }
 
     try {
-      // 20-second safety timeout so checking never hangs indefinitely
+      // 35-second safety timeout so checking never hangs indefinitely
       const timeoutPromise = new Promise<null>((_, reject) =>
-        setTimeout(() => reject(new Error("Update check request timed out")), 20000)
+        setTimeout(() => reject(new Error("Update check request timed out")), 35000)
       );
 
-      // Explicit 15-second HTTP request timeout for Tauri v2 updater client
-      const update = await Promise.race([check({ timeout: 15000 }), timeoutPromise]);
+      // Explicit 30-second (30000ms) HTTP request timeout for Tauri v2 updater client
+      const update = await Promise.race([check({ timeout: 30000 }), timeoutPromise]);
       if (update) {
         availableUpdate = update;
         showUpdateModal = true;
@@ -686,51 +686,52 @@
 
   function parseConnectionTarget(input: string): ParsedTarget {
     const raw = input.trim();
-    // 1. Check for 9-digit numeric ID: e.g. "901-435-944", "901 435 944", or "901435944"
+
+    // 1. Condition A: Input contains dots, colons, or IP structure (Direct IP / Hostname)
+    // NEVER route dots or IP formatted inputs to the signaling server!
+    if (raw.includes(".") || raw.includes(":") || raw.toLowerCase() === "localhost") {
+      // IPv4 with port: 192.168.1.100:44321, 10.0.127.125:44321
+      const ipv4WithPort = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/;
+      if (ipv4WithPort.test(raw)) {
+        const match = raw.match(ipv4WithPort)!;
+        return { kind: "direct_ip", raw, normalized: match[1], port: parseInt(match[2], 10) };
+      }
+
+      // IPv4 plain (e.g. 10.0.127.125, 20.0.255.179, 192.168.1.50) -> default port 44321
+      const ipv4Plain = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/;
+      if (ipv4Plain.test(raw)) {
+        return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
+      }
+
+      // IPv6 with port: [::1]:44321
+      const ipv6WithPort = /^\[([0-9a-fA-F:]+)\]:(\d+)$/;
+      if (ipv6WithPort.test(raw)) {
+        const match = raw.match(ipv6WithPort)!;
+        return { kind: "direct_ip", raw, normalized: `[${match[1]}]`, port: parseInt(match[2], 10) };
+      }
+
+      // Host or domain with port: e.g. desktop.local:44321
+      const hostWithPort = /^([a-zA-Z0-9.-]+):(\d+)$/;
+      if (hostWithPort.test(raw)) {
+        const match = raw.match(hostWithPort)!;
+        return { kind: "direct_ip", raw, normalized: match[1], port: parseInt(match[2], 10) };
+      }
+
+      // Plain localhost
+      if (raw.toLowerCase() === "localhost") {
+        return { kind: "direct_ip", raw, normalized: "127.0.0.1", port: 44321 };
+      }
+
+      // Any other dot/colon input: default port 44321
+      return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
+    }
+
+    // 2. Condition B: Input is numeric or contains dashes/spaces (9-digit peer ID)
     const cleanId = raw.replace(/\D/g, "");
-    if (cleanId.length === 9) {
+    if (cleanId.length > 0) {
       return { kind: "peer_id", raw, normalized: cleanId, port: 44321 };
     }
 
-    // 2. IPv4 with port: 192.168.1.100:44321
-    const ipv4WithPort = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/;
-    if (ipv4WithPort.test(raw)) {
-      const match = raw.match(ipv4WithPort)!;
-      return { kind: "direct_ip", raw, normalized: match[1], port: parseInt(match[2], 10) };
-    }
-
-    // 3. IPv4 plain: 192.168.1.100
-    const ipv4Plain = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/;
-    if (ipv4Plain.test(raw)) {
-      return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
-    }
-
-    // 4. IPv6 with port: [::1]:44321 or [fe80::1]:44321
-    const ipv6WithPort = /^\[([0-9a-fA-F:]+)\]:(\d+)$/;
-    if (ipv6WithPort.test(raw)) {
-      const match = raw.match(ipv6WithPort)!;
-      return { kind: "direct_ip", raw, normalized: `[${match[1]}]`, port: parseInt(match[2], 10) };
-    }
-
-    // 5. Host with port: desktop.local:44321, domain.com:5000
-    const hostWithPort = /^([a-zA-Z0-9.-]+):(\d+)$/;
-    if (hostWithPort.test(raw)) {
-      const match = raw.match(hostWithPort)!;
-      return { kind: "direct_ip", raw, normalized: match[1], port: parseInt(match[2], 10) };
-    }
-
-    // 6. Localhost or domain
-    if (raw.toLowerCase() === "localhost") {
-      return { kind: "direct_ip", raw, normalized: "127.0.0.1", port: 44321 };
-    }
-
-    // Fallback: If it contains dots or colons, treat as direct_ip; otherwise if digits, treat as peer ID
-    if (raw.includes(".") || raw.includes(":")) {
-      return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
-    }
-    if (/^\d+$/.test(cleanId) && cleanId.length > 0) {
-      return { kind: "peer_id", raw, normalized: cleanId, port: 44321 };
-    }
     return { kind: "direct_ip", raw, normalized: raw, port: 44321 };
   }
 
@@ -744,6 +745,17 @@
       const savedPw = localStorage.getItem("openremote_saved_pw_" + cleanKey);
       if (savedPw) {
         passwordToUse = savedPw;
+      }
+    }
+
+    // Condition B check: prevent connecting to self
+    if (parsed.kind === "peer_id") {
+      const cleanTargetId = parsed.normalized.replace(/\D/g, "");
+      const cleanLocalId = (systemInfo?.peer_id || "").replace(/\D/g, "");
+      if (cleanLocalId && cleanTargetId === cleanLocalId) {
+        connectionError = "Cannot connect to your own device ID";
+        isConnecting = false;
+        return;
       }
     }
 
@@ -1999,7 +2011,7 @@
                   <input
                     type="text"
                     class="remote-input"
-                    placeholder="Enter 9-Digit ID or IP:Port (e.g. 901-435-944 or 192.168.1.50:44321)"
+                    placeholder="Enter 9-Digit ID (e.g. 901-435-944) or Direct IP (e.g. 10.0.127.125)"
                     bind:value={targetAddress}
                     onkeypress={handleKeypressConnect}
                   />
@@ -2338,57 +2350,25 @@
               </div>
             </div>
 
-            <!-- Public Cloud Signaling & NAT Traversal Card -->
+            <!-- Network Engine Card -->
             <div class="engine-section-card">
               <div class="card-caption">
-                <span class="section-label">PUBLIC CLOUD SIGNALING</span>
-                <h2 class="card-heading">Internet Rendezvous & NAT Traversal</h2>
+                <span class="section-label">NETWORK ENGINE</span>
+                <h2 class="card-heading">Connectivity & Direct Host</h2>
               </div>
               <div class="signaling-card-content">
-                <div
-                  class="signaling-status-banner"
-                  class:online={signalingStatus === "online"}
-                  class:connecting={signalingStatus === "connecting"}
-                  class:error={signalingStatus === "error" || signalingStatus === "offline"}
-                >
-                  <span
-                    class="status-dot"
-                    class:active={signalingStatus === "online"}
-                    class:connecting={signalingStatus === "connecting"}
-                    class:warning={signalingStatus === "error" || signalingStatus === "offline"}
-                  ></span>
-                  <div class="banner-text">
-                    <span class="banner-title">
-                      {#if signalingStatus === "online"}
-                        Connected & Ready (Cloud WAN Mode)
-                      {:else if signalingStatus === "connecting"}
-                        Connecting to Signaling Relay...
-                      {:else}
-                        Signaling Disconnected (LAN Only Fallback)
-                      {/if}
-                    </span>
-                    <span class="banner-sub">
-                      {#if signalingStatus === "online"}
-                        STUN NAT Traversal active via Google Public STUN. You can dial and receive connections across different Wi-Fi networks and mobile hotspots.
-                      {:else}
-                        {signalingStatusDetails || "Remote 9-digit connections require signaling. Check network or verify signaling server URL."}
-                      {/if}
-                    </span>
-                  </div>
-                </div>
-
                 <div class="network-details-grid">
                   <div class="network-detail-item">
-                    <span class="detail-label">Network Architecture:</span>
-                    <span class="detail-val highlight">Zero-Config Cloud Mesh (AnyDesk-style)</span>
+                    <span class="detail-label">Network Protocol:</span>
+                    <span class="detail-val highlight">Zero-Config AnyDesk-Style Mesh</span>
                   </div>
                   <div class="network-detail-item">
-                    <span class="detail-label">Direct LAN Address:</span>
-                    <span class="detail-val">{systemInfo?.lan_ip || "127.0.0.1"}:44321</span>
+                    <span class="detail-label">Host LAN Binding:</span>
+                    <span class="detail-val">0.0.0.0:44321 ({systemInfo?.lan_ip || "127.0.0.1"}:44321)</span>
                   </div>
                   <div class="network-detail-item">
-                    <span class="detail-label">NAT Traversal:</span>
-                    <span class="detail-val">Google STUN (Autonomous WAN Traversal)</span>
+                    <span class="detail-label">Data Transport:</span>
+                    <span class="detail-val">SIMD LZ4-Flex UDP / TCP Stream</span>
                   </div>
                 </div>
               </div>
@@ -4229,42 +4209,6 @@
     flex-direction: column;
     gap: 16px;
     margin-top: 14px;
-  }
-  .signaling-status-banner {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 14px 16px;
-    border-radius: 8px;
-    background: rgba(15, 23, 42, 0.6);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-  }
-  .signaling-status-banner.online {
-    background: rgba(34, 197, 94, 0.08);
-    border-color: rgba(34, 197, 94, 0.25);
-  }
-  .signaling-status-banner.connecting {
-    background: rgba(59, 130, 246, 0.08);
-    border-color: rgba(59, 130, 246, 0.25);
-  }
-  .signaling-status-banner.error {
-    background: rgba(245, 158, 11, 0.08);
-    border-color: rgba(245, 158, 11, 0.25);
-  }
-  .banner-text {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .banner-title {
-    font-size: 0.88rem;
-    font-weight: 600;
-    color: #f1f5f9;
-  }
-  .banner-sub {
-    font-size: 0.78rem;
-    color: #94a3b8;
-    line-height: 1.4;
   }
   .network-details-grid {
     display: flex;
