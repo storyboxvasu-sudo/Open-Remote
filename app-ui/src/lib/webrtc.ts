@@ -477,6 +477,9 @@ export class WebRTCSession {
 
     // 2. control channel: ordered reliable
     const controlChannel = pc.createDataChannel("control", { ordered: true });
+    controlChannel.onopen = () => {
+      controlChannel.send(JSON.stringify({ type: "get_displays" }));
+    };
     controlChannel.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
@@ -545,9 +548,37 @@ export class WebRTCSession {
         };
       } else if (channel.label === "control") {
         this.controlChannel = channel;
-        channel.onmessage = (e) => {
+        channel.onopen = async () => {
+          try {
+            const displays: any[] = await invoke("get_available_displays");
+            channel.send(
+              JSON.stringify({
+                type: "display_manifest",
+                displays,
+                active_display_id: 0,
+              })
+            );
+          } catch (_e) {}
+        };
+        channel.onmessage = async (e) => {
           try {
             const msg = JSON.parse(e.data);
+            if (msg.type === "get_displays") {
+              const displays: any[] = await invoke("get_available_displays");
+              channel.send(
+                JSON.stringify({
+                  type: "display_manifest",
+                  displays,
+                  active_display_id: 0,
+                })
+              );
+            } else if (
+              (msg.type === "switch_display" || msg.type === "request_display_switch") &&
+              typeof (msg.display_id ?? msg.targetDisplayIndex ?? msg.monitor_index) === "number"
+            ) {
+              const target = msg.display_id ?? msg.targetDisplayIndex ?? msg.monitor_index;
+              await invoke("switch_capture_display", { displayId: target });
+            }
             if (this.onControlMessage) this.onControlMessage(msg);
           } catch (_e) {}
         };
@@ -604,6 +635,8 @@ export class WebRTCSession {
       feedSocket.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer && this.videoChannel && this.videoChannel.readyState === "open") {
           sendChunkedData(this.videoChannel, event.data);
+        } else if (typeof event.data === "string" && this.controlChannel && this.controlChannel.readyState === "open") {
+          this.controlChannel.send(event.data);
         }
       };
 

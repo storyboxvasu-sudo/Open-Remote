@@ -50,6 +50,7 @@
     initial_access_level?: AccessLevel;
     requires_password?: boolean;
     challenge?: string;
+    displays?: RemoteDisplay[];
   }
 
   interface MonitorDescriptor {
@@ -514,13 +515,15 @@
       webrtcSession = new WebRTCSession(signalingClient!, cleanLocalId);
       webrtcSession.onControlMessage = async (msg) => {
         console.log("[webrtc host] Received control msg:", msg);
-        if (msg.type === "request_display_switch") {
-          const targetIndex = msg.targetDisplayIndex !== undefined ? msg.targetDisplayIndex : msg.monitor_index;
+        if (msg.type === "switch_display" || msg.type === "request_display_switch") {
+          const targetIndex = msg.display_id !== undefined
+            ? msg.display_id
+            : (msg.targetDisplayIndex !== undefined ? msg.targetDisplayIndex : msg.monitor_index);
           try {
-            await invoke("switch_monitor", { monitorIndex: targetIndex });
+            await invoke("switch_capture_display", { displayId: targetIndex });
             activeMonitorIndex = targetIndex;
           } catch (e) {
-            console.error("Failed to switch host monitor on request_display_switch:", e);
+            console.error("Failed to switch host display on switch_display:", e);
           }
         }
       };
@@ -632,7 +635,8 @@
     // 1. Send control message over WebRTC data channel if active WAN session
     if (webrtcSession && webrtcSession.isConnected()) {
       webrtcSession.sendControl({
-        type: "request_display_switch",
+        type: "switch_display",
+        display_id: index,
         targetDisplayIndex: index,
         monitor_index: index,
       });
@@ -847,6 +851,17 @@
             if (res.initial_access_level) {
               clientAccessLevel = res.initial_access_level;
             }
+            if (res.displays && Array.isArray(res.displays) && res.displays.length > 0) {
+              remoteDisplays = res.displays.map((d: any) => ({
+                id: d.id,
+                name: d.name,
+                resolution: `${d.width}x${d.height}`,
+                width: d.width,
+                height: d.height,
+                is_primary: d.is_primary,
+              }));
+              activeRemoteDisplayId = 0;
+            }
             loadRecentSessions();
             initStreamWebSocket(res.local_ws_port);
             return;
@@ -882,6 +897,17 @@
           isSubmittingAuth = false;
           if (res.initial_access_level) {
             clientAccessLevel = res.initial_access_level;
+          }
+          if (res.displays && Array.isArray(res.displays) && res.displays.length > 0) {
+            remoteDisplays = res.displays.map((d: any) => ({
+              id: d.id,
+              name: d.name,
+              resolution: `${d.width}x${d.height}`,
+              width: d.width,
+              height: d.height,
+              is_primary: d.is_primary,
+            }));
+            activeRemoteDisplayId = 0;
           }
           loadRecentSessions();
           initStreamWebSocket(res.local_ws_port);
@@ -1811,6 +1837,61 @@
           oncontextmenu={(e) => e.preventDefault()}
         ></canvas>
 
+        <!-- Sleek Top Floating Monitor Switcher Toolbar (Visible over remote screen whenever multi-monitor is available) -->
+        {#if remoteDisplays.length > 1}
+          <div class="remote-display-switcher-bar">
+            <div class="switcher-bar-inner">
+              <span class="switcher-bar-label">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                  <line x1="8" y1="21" x2="16" y2="21"></line>
+                  <line x1="12" y1="17" x2="12" y2="21"></line>
+                </svg>
+                <span>Screens</span>
+              </span>
+              <div class="switcher-buttons-group">
+                {#each remoteDisplays as disp, i}
+                  <button
+                    type="button"
+                    class="btn-display-switch"
+                    class:active={activeRemoteDisplayId === disp.id}
+                    class:loading={switchingDisplay && switchingToDisplayIndex === disp.id}
+                    onclick={() => switchRemoteDisplay(disp.id)}
+                    title={`${disp.name} (${disp.width}x${disp.height})`}
+                    disabled={switchingDisplay && switchingToDisplayIndex === disp.id}
+                  >
+                    {#if switchingDisplay && switchingToDisplayIndex === disp.id}
+                      <span class="btn-spinner"></span>
+                    {:else}
+                      <span class="display-btn-num">{i + 1}</span>
+                    {/if}
+                    <span class="display-btn-text">Display {i + 1}</span>
+                    {#if disp.is_primary}
+                      <span class="display-primary-tag">Primary</span>
+                    {/if}
+                  </button>
+                {/each}
+                <button
+                  type="button"
+                  class="btn-display-switch btn-full-canvas"
+                  class:active={activeRemoteDisplayId === 0 && !remoteDisplays.some(d => d.id === 0 && activeRemoteDisplayId !== 0)}
+                  onclick={() => switchRemoteDisplay(0)}
+                  title="Switch to Primary Display / Combined View"
+                  disabled={switchingDisplay && switchingToDisplayIndex === 0}
+                >
+                  <span class="display-btn-text">Full Canvas</span>
+                </button>
+              </div>
+              {#if switchingDisplay}
+                <span class="switcher-bar-status">
+                  <span class="feedback-spinner"></span>
+                  <span>Switching to Display {((switchingToDisplayIndex ?? 0) < remoteDisplays.length ? (switchingToDisplayIndex ?? 0) + 1 : 1)}...</span>
+                </span>
+              {/if}
+            </div>
+          </div>
+        {/if}
+
         <!-- Floating Quick HUD (Only active during Fullscreen Mode, perfectly centered) -->
         {#if isFullscreen}
           <div class="session-hud">
@@ -1818,20 +1899,20 @@
             {#if remoteDisplays.length > 1}
               <div class="monitor-switcher">
                 <span class="switcher-title">Display:</span>
-                {#each remoteDisplays as disp}
+                {#each remoteDisplays as disp, i}
                   <button
                     class="btn-mon-pill"
                     class:active={activeRemoteDisplayId === disp.id}
                     onclick={() => switchRemoteDisplay(disp.id)}
                     title={`${disp.name} (${disp.width}x${disp.height})`}
                   >
-                    🖥 Display {disp.id}
+                    🖥 Display {i + 1}
                   </button>
                 {/each}
               </div>
             {:else}
               <div class="monitor-badge">
-                <span class="badge-icon">🖥</span> {remoteDisplays[0]?.name || "DELL E2421HN"}
+                <span class="badge-icon">🖥</span> {remoteDisplays[0]?.name || "Display 1"}
               </div>
             {/if}
 
@@ -3863,6 +3944,140 @@
     -webkit-user-select: none;
     overflow: hidden;
     position: relative;
+  }
+
+  /* Remote Multi-Monitor Top Floating Toolbar */
+  .remote-display-switcher-bar {
+    position: absolute;
+    top: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 50;
+    pointer-events: auto;
+    user-select: none;
+    -webkit-user-select: none;
+    animation: fadeInSlideDown 0.25s ease-out;
+  }
+
+  @keyframes fadeInSlideDown {
+    from {
+      opacity: 0;
+      transform: translate(-50%, -10px);
+    }
+    to {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
+  }
+
+  .switcher-bar-inner {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(15, 23, 42, 0.88);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.05);
+    padding: 4px 8px;
+    border-radius: 20px;
+    box-sizing: border-box;
+  }
+
+  .switcher-bar-label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #94a3b8;
+    padding: 0 4px 0 6px;
+  }
+
+  .switcher-buttons-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .btn-display-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #cbd5e1;
+    font-size: 0.74rem;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 14px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+
+  .btn-display-switch:hover:not(:disabled) {
+    background: rgba(79, 70, 229, 0.25);
+    border-color: rgba(99, 102, 241, 0.5);
+    color: #e0e7ff;
+    transform: translateY(-1px);
+  }
+
+  .btn-display-switch.active {
+    background: #4f46e5 !important;
+    border-color: #818cf8 !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+    box-shadow: 0 0 12px rgba(99, 102, 241, 0.6) !important;
+  }
+
+  .btn-display-switch.btn-full-canvas {
+    background: rgba(255, 255, 255, 0.04);
+    border-style: dashed;
+  }
+
+  .display-btn-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.12);
+    font-size: 0.65rem;
+    font-weight: 700;
+  }
+
+  .btn-display-switch.active .display-btn-num {
+    background: rgba(255, 255, 255, 0.25);
+  }
+
+  .display-primary-tag {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: rgba(14, 165, 233, 0.25);
+    color: #38bdf8;
+    padding: 1px 4px;
+    border-radius: 4px;
+    font-weight: 700;
+  }
+
+  .btn-display-switch.active .display-primary-tag {
+    background: rgba(255, 255, 255, 0.2);
+    color: #ffffff;
+  }
+
+  .switcher-bar-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.72rem;
+    color: #a5b4fc;
+    font-weight: 600;
+    padding: 0 8px;
   }
 
   .zoom-reset-btn {

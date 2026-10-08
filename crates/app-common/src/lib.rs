@@ -23,6 +23,45 @@ pub struct MonitorDescriptor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayInfo {
+    pub id: usize,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub x_offset: i32,
+    pub y_offset: i32,
+    pub is_primary: bool,
+}
+
+impl From<MonitorDescriptor> for DisplayInfo {
+    fn from(m: MonitorDescriptor) -> Self {
+        Self {
+            id: m.index,
+            name: m.name,
+            width: m.width,
+            height: m.height,
+            x_offset: m.x,
+            y_offset: m.y,
+            is_primary: m.is_primary,
+        }
+    }
+}
+
+impl From<DisplayInfo> for MonitorDescriptor {
+    fn from(d: DisplayInfo) -> Self {
+        Self {
+            index: d.id,
+            name: d.name,
+            width: d.width,
+            height: d.height,
+            is_primary: d.is_primary,
+            x: d.x_offset,
+            y: d.y_offset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHandshake {
     pub host_peer_id: String,
     pub monitors: Vec<MonitorDescriptor>,

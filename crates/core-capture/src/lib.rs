@@ -1,4 +1,4 @@
-use app_common::MonitorDescriptor;
+use app_common::{DisplayInfo, MonitorDescriptor};
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -409,7 +409,7 @@ pub fn enumerate_win32_monitors_full() -> Vec<Win32MonitorEntry> {
         TRUE
     }
 
-    let mut list = Vec::new();
+    let mut list: Vec<Win32MonitorEntry> = Vec::new();
     unsafe {
         EnumDisplayMonitors(
             std::ptr::null_mut(),
@@ -419,12 +419,32 @@ pub fn enumerate_win32_monitors_full() -> Vec<Win32MonitorEntry> {
         );
     }
 
+    // Sort: Primary monitor first, then left-to-right (x coordinate), then top-to-bottom (y coordinate)
+    list.sort_by(|a: &Win32MonitorEntry, b: &Win32MonitorEntry| {
+        b.descriptor.is_primary.cmp(&a.descriptor.is_primary)
+            .then_with(|| a.descriptor.x.cmp(&b.descriptor.x))
+            .then_with(|| a.descriptor.y.cmp(&b.descriptor.y))
+    });
+
+    for (idx, entry) in list.iter_mut().enumerate() {
+        entry.descriptor.index = idx;
+        if entry.descriptor.name.is_empty() || entry.descriptor.name.starts_with("Display ") {
+            if entry.descriptor.is_primary {
+                entry.descriptor.name = format!("Display {} (Primary)", idx + 1);
+            } else {
+                entry.descriptor.name = format!("Display {}", idx + 1);
+            }
+        } else if entry.descriptor.is_primary && !entry.descriptor.name.contains("Primary") {
+            entry.descriptor.name = format!("{} (Primary)", entry.descriptor.name);
+        }
+    }
+
     if list.is_empty() {
         list.push(Win32MonitorEntry {
             hmonitor: std::ptr::null_mut(),
             descriptor: MonitorDescriptor {
                 index: 0,
-                name: "Display 1".to_string(),
+                name: "Display 1 (Primary)".to_string(),
                 width: 1920,
                 height: 1080,
                 is_primary: true,
@@ -752,6 +772,17 @@ impl ScreenCapturer {
                 y: 0,
             }]
         }
+    }
+
+    pub fn enumerate_displays() -> Vec<DisplayInfo> {
+        Self::enumerate_monitors()
+            .into_iter()
+            .map(DisplayInfo::from)
+            .collect()
+    }
+
+    pub fn switch_capture_display(&self, display_id: usize) -> Result<(), CaptureError> {
+        self.switch_monitor(display_id)
     }
 
     pub fn request_screen_capture_permission() -> bool {

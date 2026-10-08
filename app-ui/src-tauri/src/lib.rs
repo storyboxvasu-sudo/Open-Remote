@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 
 use app_common::{
-    AccessLevel, HostSessionInfo, IncomingRequestInfo, InputEvent,
+    AccessLevel, DisplayInfo, HostSessionInfo, IncomingRequestInfo, InputEvent,
     MonitorDescriptor, PeerConfig, PeerId, RecentSession, UnattendedAccessConfig,
 };
 use core_capture::ScreenCapturer;
@@ -60,6 +60,8 @@ pub struct ClientConnectResult {
     pub requires_password: bool,
     #[serde(default)]
     pub challenge: Option<String>,
+    #[serde(default)]
+    pub displays: Vec<DisplayInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +256,15 @@ async fn internal_start_hosting(
         while let Ok((stream, _)) = host_ws_listener.accept().await {
             let _ = stream.set_nodelay(true);
             if let Ok(mut ws_stream) = accept_async(stream).await {
+                // Immediately broadcast available display manifest on connection accept
+                let displays = ScreenCapturer::enumerate_displays();
+                let manifest_json = serde_json::to_string(&serde_json::json!({
+                    "type": "display_manifest",
+                    "displays": displays,
+                    "active_display_id": capturer_ws.active_monitor_index(),
+                })).unwrap_or_default();
+                let _ = ws_stream.send(Message::Text(manifest_json.into())).await;
+
                 let enc = FrameEncoder::new();
                 let mut last_seq = 0u64;
                 let mut last_send_time = tokio::time::Instant::now();
@@ -567,6 +578,8 @@ async fn internal_connect_to_socket_addr(
         bridge_task: Some(bridge_task),
     });
 
+    let available_displays = ScreenCapturer::enumerate_displays();
+
     Ok(ClientConnectResult {
         success: true,
         local_ws_port,
@@ -575,6 +588,7 @@ async fn internal_connect_to_socket_addr(
         initial_access_level,
         requires_password: false,
         challenge: None,
+        displays: available_displays,
     })
 }
 
@@ -899,6 +913,11 @@ fn get_available_monitors() -> Vec<MonitorDescriptor> {
 }
 
 #[tauri::command]
+fn get_available_displays() -> Vec<DisplayInfo> {
+    ScreenCapturer::enumerate_displays()
+}
+
+#[tauri::command]
 async fn switch_monitor(
     monitor_index: usize,
     state: State<'_, AppEngineState>,
@@ -907,6 +926,18 @@ async fn switch_monitor(
         .capturer
         .switch_monitor(monitor_index)
         .map_err(|e| format!("Failed to switch monitor: {:?}", e))?;
+    Ok(true)
+}
+
+#[tauri::command]
+async fn switch_capture_display(
+    display_id: usize,
+    state: State<'_, AppEngineState>,
+) -> Result<bool, String> {
+    state
+        .capturer
+        .switch_capture_display(display_id)
+        .map_err(|e| format!("Failed to switch capture display: {:?}", e))?;
     Ok(true)
 }
 
@@ -1353,7 +1384,9 @@ pub fn run() {
             set_signaling_url,
             get_host_feed_port,
             get_available_monitors,
+            get_available_displays,
             switch_monitor,
+            switch_capture_display,
             switch_remote_monitor,
             get_recent_sessions,
             save_recent_session,
