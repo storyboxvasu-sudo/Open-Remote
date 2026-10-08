@@ -713,25 +713,29 @@ impl DirectLanHost {
                         *access_lvl_clone.write() = chosen_level;
                         *active_client_clone.write() = Some((client_peer_id.clone(), client_ip.clone()));
 
-                        // 4. Video Streaming loop
                         let mut last_seq = 0u64;
                         let mut last_monitor = cap.active_monitor_index();
                         let mut send_monitors = true;
                         let mut last_send_time = tokio::time::Instant::now();
                         let mut last_mon_check_time = tokio::time::Instant::now();
                         let mut last_mon_count = ScreenCapturer::enumerate_monitors().len();
+                        let mut last_wm_change = core_capture::display_change_counter();
 
                         loop {
                             let current_seq = cap.frame_counter();
                             let current_mon = cap.active_monitor_index();
+                            let current_wm = core_capture::display_change_counter();
+                            let wm_changed = current_wm != last_wm_change;
 
-                            // Periodic hotplug & topology check every 1000ms
-                            if last_mon_check_time.elapsed().as_millis() >= 1000 {
+                            // OS WM_DISPLAYCHANGE event or periodic topology check
+                            if wm_changed || last_mon_check_time.elapsed().as_millis() >= 1000 {
+                                last_wm_change = current_wm;
                                 last_mon_check_time = tokio::time::Instant::now();
                                 let current_monitors = ScreenCapturer::enumerate_monitors();
-                                if current_monitors.len() != last_mon_count {
+                                if wm_changed || current_monitors.len() != last_mon_count {
                                     eprintln!(
-                                        "[core-net] Display configuration change detected (count: {} -> {})",
+                                        "[core-net] Display configuration change detected (WM event: {}, count: {} -> {})",
+                                        wm_changed,
                                         last_mon_count,
                                         current_monitors.len()
                                     );

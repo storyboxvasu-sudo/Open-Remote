@@ -54,6 +54,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Verify Version Parity Across Manifests
+        shell: bash
+        run: |
+          echo "=== Verifying version parity across manifests ==="
+          TAURI_VER=$(node -e "console.log(require('./app-ui/src-tauri/tauri.conf.json').version)")
+          PKG_VER=$(node -e "console.log(require('./app-ui/package.json').version)")
+          CARGO_VER=$(node -e "const fs=require('fs');const m=fs.readFileSync('./app-ui/src-tauri/Cargo.toml','utf8').match(/^version\s*=\s*\"([^\"]+)\"/m);console.log(m?m[1]:'');")
+          echo "tauri.conf.json version: $TAURI_VER"
+          echo "package.json version:    $PKG_VER"
+          echo "Cargo.toml version:      $CARGO_VER"
+          if [ "$TAURI_VER" != "$PKG_VER" ] || [ "$TAURI_VER" != "$CARGO_VER" ]; then
+            echo "ERROR: Version mismatch between manifests! All must match to prevent signature verification errors."
+            exit 1
+          fi
+          echo "Version parity check passed ($TAURI_VER)."
+
       - name: Install Frontend Dependencies
         working-directory: app-ui
         run: pnpm install

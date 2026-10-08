@@ -1673,7 +1673,7 @@
           <!-- Device Name / Display Switcher -->
           {#if remoteDisplays.length > 1}
             <div class="monitor-switcher" data-tauri-drag-region="false">
-              <span class="switcher-title">Display:</span>
+              <span class="switcher-title">Monitors:</span>
               {#each remoteDisplays as disp, i}
                 <button
                   class="btn-mon-pill"
@@ -1687,21 +1687,21 @@
                   {:else}
                     <span class="mon-icon">🖥</span>
                   {/if}
-                  Display {i + 1}
+                  Monitor {i + 1}
                 </button>
               {/each}
 
               {#if switchingDisplay}
                 <span class="switching-feedback">
                   <span class="feedback-spinner"></span>
-                  Switching to Display {((switchingToDisplayIndex ?? 0) < remoteDisplays.length ? (switchingToDisplayIndex ?? 0) + 1 : 1)}...
+                  Switching to Monitor {((switchingToDisplayIndex ?? 0) < remoteDisplays.length ? (switchingToDisplayIndex ?? 0) + 1 : 1)}...
                 </span>
               {/if}
             </div>
           {:else}
             <div class="monitor-badge" data-tauri-drag-region="false" title="Connected Remote Display">
               <span class="badge-icon">🖥</span>
-              <span class="device-name">{remoteDisplays[0]?.name || "Display 1"}</span>
+              <span class="device-name">{remoteDisplays[0]?.name || "Monitor 1"}</span>
             </div>
           {/if}
 
@@ -1847,7 +1847,7 @@
                   <line x1="8" y1="21" x2="16" y2="21"></line>
                   <line x1="12" y1="17" x2="12" y2="21"></line>
                 </svg>
-                <span>Screens</span>
+                <span>Monitors</span>
               </span>
               <div class="switcher-buttons-group">
                 {#each remoteDisplays as disp, i}
@@ -1865,27 +1865,17 @@
                     {:else}
                       <span class="display-btn-num">{i + 1}</span>
                     {/if}
-                    <span class="display-btn-text">Display {i + 1}</span>
+                    <span class="display-btn-text">Monitor {i + 1}</span>
                     {#if disp.is_primary}
                       <span class="display-primary-tag">Primary</span>
                     {/if}
                   </button>
                 {/each}
-                <button
-                  type="button"
-                  class="btn-display-switch btn-full-canvas"
-                  class:active={activeRemoteDisplayId === 0 && !remoteDisplays.some(d => d.id === 0 && activeRemoteDisplayId !== 0)}
-                  onclick={() => switchRemoteDisplay(0)}
-                  title="Switch to Primary Display / Combined View"
-                  disabled={switchingDisplay && switchingToDisplayIndex === 0}
-                >
-                  <span class="display-btn-text">Full Canvas</span>
-                </button>
               </div>
               {#if switchingDisplay}
                 <span class="switcher-bar-status">
                   <span class="feedback-spinner"></span>
-                  <span>Switching to Display {((switchingToDisplayIndex ?? 0) < remoteDisplays.length ? (switchingToDisplayIndex ?? 0) + 1 : 1)}...</span>
+                  <span>Switching to Monitor {((switchingToDisplayIndex ?? 0) < remoteDisplays.length ? (switchingToDisplayIndex ?? 0) + 1 : 1)}...</span>
                 </span>
               {/if}
             </div>
@@ -1898,7 +1888,7 @@
             <!-- Multi-Monitor Switcher Buttons (Dynamic Remote Displays) -->
             {#if remoteDisplays.length > 1}
               <div class="monitor-switcher">
-                <span class="switcher-title">Display:</span>
+                <span class="switcher-title">Monitors:</span>
                 {#each remoteDisplays as disp, i}
                   <button
                     class="btn-mon-pill"
@@ -1906,13 +1896,13 @@
                     onclick={() => switchRemoteDisplay(disp.id)}
                     title={`${disp.name} (${disp.width}x${disp.height})`}
                   >
-                    🖥 Display {i + 1}
+                    🖥 Monitor {i + 1}
                   </button>
                 {/each}
               </div>
             {:else}
               <div class="monitor-badge">
-                <span class="badge-icon">🖥</span> {remoteDisplays[0]?.name || "Display 1"}
+                <span class="badge-icon">🖥</span> {remoteDisplays[0]?.name || "Monitor 1"}
               </div>
             {/if}
 
@@ -4031,11 +4021,6 @@
     color: #ffffff !important;
     font-weight: 700 !important;
     box-shadow: 0 0 12px rgba(99, 102, 241, 0.6) !important;
-  }
-
-  .btn-display-switch.btn-full-canvas {
-    background: rgba(255, 255, 255, 0.04);
-    border-style: dashed;
   }
 
   .display-btn-num {

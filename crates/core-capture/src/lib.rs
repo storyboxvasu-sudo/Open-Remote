@@ -356,6 +356,87 @@ fn start_gdi(x: i32, y: i32, width: u32, height: u32, shared: CaptureShared) -> 
 }
 
 #[cfg(target_os = "windows")]
+static DISPLAY_CHANGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
+pub fn display_change_counter() -> u64 {
+    DISPLAY_CHANGE_COUNTER.load(Ordering::Acquire)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn display_change_counter() -> u64 {
+    0
+}
+
+#[cfg(target_os = "windows")]
+pub fn start_wm_display_change_listener() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let _ = std::thread::Builder::new()
+        .name("openremote-wm-displaychange".to_string())
+        .spawn(|| {
+            use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
+                MSG, WNDCLASSW, HWND_MESSAGE, WM_DISPLAYCHANGE,
+            };
+
+            unsafe extern "system" fn wnd_proc(
+                hwnd: HWND,
+                msg: u32,
+                wparam: WPARAM,
+                lparam: LPARAM,
+            ) -> LRESULT {
+                if msg == WM_DISPLAYCHANGE {
+                    eprintln!("[core-capture] OS WM_DISPLAYCHANGE event received!");
+                    DISPLAY_CHANGE_COUNTER.fetch_add(1, Ordering::Release);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+
+            let class_name: Vec<u16> = "OpenRemoteDisplayChangeHook\0".encode_utf16().collect();
+            let wc = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: std::ptr::null_mut(),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+            };
+
+            unsafe {
+                RegisterClassW(&wc);
+                let _hwnd = CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    class_name.as_ptr(),
+                    0,
+                    0, 0, 0, 0,
+                    HWND_MESSAGE,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+
+                let mut msg: MSG = std::mem::zeroed();
+                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                    DispatchMessageW(&msg);
+                }
+            }
+        });
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn start_wm_display_change_listener() {}
+
+#[cfg(target_os = "windows")]
 #[derive(Clone, Debug)]
 pub struct Win32MonitorEntry {
     pub hmonitor: windows_sys::Win32::Graphics::Gdi::HMONITOR,
@@ -391,7 +472,7 @@ pub fn enumerate_win32_monitors_full() -> Vec<Win32MonitorEntry> {
             }))
             .ok()
             .flatten()
-            .unwrap_or_else(|| format!("Display {}", index + 1));
+            .unwrap_or_else(|| format!("Monitor {}", index + 1));
 
             list.push(Win32MonitorEntry {
                 hmonitor: hmon,
@@ -428,11 +509,11 @@ pub fn enumerate_win32_monitors_full() -> Vec<Win32MonitorEntry> {
 
     for (idx, entry) in list.iter_mut().enumerate() {
         entry.descriptor.index = idx;
-        if entry.descriptor.name.is_empty() || entry.descriptor.name.starts_with("Display ") {
+        if entry.descriptor.name.is_empty() || entry.descriptor.name.starts_with("Display ") || entry.descriptor.name.starts_with("Monitor ") {
             if entry.descriptor.is_primary {
-                entry.descriptor.name = format!("Display {} (Primary)", idx + 1);
+                entry.descriptor.name = format!("Monitor {} (Primary)", idx + 1);
             } else {
-                entry.descriptor.name = format!("Display {}", idx + 1);
+                entry.descriptor.name = format!("Monitor {}", idx + 1);
             }
         } else if entry.descriptor.is_primary && !entry.descriptor.name.contains("Primary") {
             entry.descriptor.name = format!("{} (Primary)", entry.descriptor.name);
@@ -444,7 +525,7 @@ pub fn enumerate_win32_monitors_full() -> Vec<Win32MonitorEntry> {
             hmonitor: std::ptr::null_mut(),
             descriptor: MonitorDescriptor {
                 index: 0,
-                name: "Display 1 (Primary)".to_string(),
+                name: "Monitor 1 (Primary)".to_string(),
                 width: 1920,
                 height: 1080,
                 is_primary: true,
@@ -579,9 +660,9 @@ pub mod macos_capture {
                 let is_primary = d_id == main_id;
                 let index = i;
                 let name = if is_primary {
-                    format!("Display {} (Built-in / Primary)", index + 1)
+                    format!("Monitor {} (Primary)", index + 1)
                 } else {
-                    format!("Display {} (External)", index + 1)
+                    format!("Monitor {}", index + 1)
                 };
 
                 list.push(MonitorDescriptor {
@@ -609,7 +690,7 @@ pub mod macos_capture {
 
             list.push(MonitorDescriptor {
                 index: 0,
-                name: "Display 1 (Primary)".to_string(),
+                name: "Monitor 1 (Primary)".to_string(),
                 width,
                 height,
                 is_primary: true,
@@ -621,7 +702,7 @@ pub mod macos_capture {
         if list.is_empty() {
             list.push(MonitorDescriptor {
                 index: 0,
-                name: "Primary Display".to_string(),
+                name: "Monitor 1 (Primary)".to_string(),
                 width: 1920,
                 height: 1080,
                 is_primary: true,
@@ -764,7 +845,7 @@ impl ScreenCapturer {
         {
             vec![MonitorDescriptor {
                 index: 0,
-                name: "Primary Display".to_string(),
+                name: "Monitor 1 (Primary)".to_string(),
                 width: 1920,
                 height: 1080,
                 is_primary: true,
@@ -803,6 +884,7 @@ impl ScreenCapturer {
     pub fn new_with_monitor_index(index: usize) -> Result<Self, CaptureError> {
         #[cfg(target_os = "windows")]
         {
+            start_wm_display_change_listener();
             let all_monitors = enumerate_win32_monitors_full();
             let target_idx = if index < all_monitors.len() {
                 index
