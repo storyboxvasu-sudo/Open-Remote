@@ -1,3 +1,5 @@
+# Release workflow for multi-platform binaries and updater packages
+# Windows updater artifact signing and bundle collection is coordinated with build-windows.yml
 name: Release
 
 on:
