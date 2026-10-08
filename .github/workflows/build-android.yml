@@ -111,5 +111,7 @@ jobs:
         with:
           files: artifacts/app-release.apk
           token: ${{ secrets.GITHUB_TOKEN }}
+          make_latest: true
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
