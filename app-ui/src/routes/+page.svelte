@@ -138,9 +138,19 @@
 
   // Permissions & Incoming Requests State
   let incomingRequest = $state<IncomingRequestInfo | null>(null);
+  let pendingWebRtcOffer = $state<{ fromPeerId: string; sdp: string } | null>(null);
   let showIncomingModal = $state(false);
-  let selectedIncomingPermission = $state<AccessLevel>("Standard");
+  let selectedIncomingPermission = $state<AccessLevel>("FullAccess");
   let hostSession = $state<HostSessionInfo | null>(null);
+
+  function formatCallerId(id?: string | null): string {
+    if (!id) return "Unknown";
+    const digits = id.replace(/\D/g, "");
+    if (digits.length === 9) {
+      return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6, 9)}`;
+    }
+    return id;
+  }
   let activeDashboardTab = $state<"connect" | "permissions" | "engine">("connect");
   let clientAccessLevel = $state<AccessLevel>("Standard");
   let unlistenIncoming: UnlistenFn | null = null;
@@ -295,12 +305,20 @@
   }
 
   async function acceptIncomingConnection() {
+    if (pendingWebRtcOffer) {
+      const offer = pendingWebRtcOffer;
+      pendingWebRtcOffer = null;
+      showIncomingModal = false;
+      incomingRequest = null;
+      await handleIncomingWebRtcOffer(offer.fromPeerId, offer.sdp);
+      return;
+    }
     if (!incomingRequest) return;
     try {
       await invoke("respond_connection_request", {
         requestId: incomingRequest.request_id,
         accept: true,
-        accessLevel: selectedIncomingPermission,
+        accessLevel: "FullAccess",
       });
       showIncomingModal = false;
       incomingRequest = null;
@@ -311,6 +329,12 @@
   }
 
   async function declineIncomingConnection() {
+    if (pendingWebRtcOffer) {
+      pendingWebRtcOffer = null;
+      showIncomingModal = false;
+      incomingRequest = null;
+      return;
+    }
     if (!incomingRequest) return;
     try {
       await invoke("respond_connection_request", {
@@ -479,7 +503,17 @@
 
     signalingClient.onOffer = async (fromPeerId, sdp) => {
       console.log(`[signaling] Incoming WebRTC offer from ${fromPeerId}`);
-      await handleIncomingWebRtcOffer(fromPeerId, sdp);
+      if (!unattendedConfig.enabled) {
+        pendingWebRtcOffer = { fromPeerId, sdp };
+        incomingRequest = {
+          request_id: "webrtc_" + fromPeerId,
+          client_peer_id: fromPeerId,
+          client_ip: "Cloud WAN (Encrypted)",
+        };
+        showIncomingModal = true;
+      } else {
+        await handleIncomingWebRtcOffer(fromPeerId, sdp);
+      }
     };
 
     signalingClient.onAnswer = async (fromPeerId, sdp) => {
@@ -765,6 +799,7 @@
 
     isConnecting = true;
     connectionError = "";
+    showAuthModal = false;
     authModalError = "";
     pendingAuthTarget = parsed.raw;
 
@@ -916,10 +951,8 @@
       }
     } catch (err: any) {
       const errMsg = typeof err === "string" ? err : (err?.message || JSON.stringify(err));
-      if (showAuthModal || errMsg.includes("password") || errMsg.includes("Incorrect")) {
-        authModalError = errMsg.includes("Incorrect") || errMsg.includes("password")
-          ? "Incorrect password. Please try again."
-          : errMsg;
+      if (showAuthModal && (errMsg.includes("Incorrect") || errMsg.includes("password"))) {
+        authModalError = "Incorrect password. Please try again.";
         localStorage.removeItem("openremote_saved_pw_" + cleanKey);
         showAuthModal = true;
         setTimeout(() => {
@@ -927,6 +960,7 @@
           if (el) el.focus();
         }, 50);
       } else {
+        showAuthModal = false;
         connectionError = parsed.kind === "direct_ip"
           ? "Unable to reach IP:Port. Verify IP address and firewall settings."
           : (errMsg || "Unable to establish connection to partner.");
@@ -1572,11 +1606,9 @@
       });
 
       unlistenIncoming = await listen<IncomingRequestInfo>("incoming-connection-request", (event) => {
+        pendingWebRtcOffer = null;
         incomingRequest = event.payload;
         showIncomingModal = true;
-        if (hostSession) {
-          selectedIncomingPermission = hostSession.default_access_level || "Standard";
-        }
       });
 
       unlistenSession = await listen<HostSessionInfo>("session-status-changed", (event) => {
@@ -1584,6 +1616,7 @@
         if (hostSession && hostSession.is_active) {
           showIncomingModal = false;
           incomingRequest = null;
+          pendingWebRtcOffer = null;
         }
       });
     } catch (err) {
@@ -2601,13 +2634,13 @@
       </div>
     {/if}
 
-    <!-- Incoming Connection Request Modal Dialog -->
+    <!-- Incoming Connection Request Modal Dialog (AnyDesk Style) -->
     {#if showIncomingModal && incomingRequest}
       <div class="modal-backdrop">
-        <div class="modal-card">
+        <div class="modal-card incoming-modal-card">
           <div class="modal-header">
-            <div class="modal-badge-icon">
-              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <div class="modal-badge-icon incoming-badge-icon">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
                 <circle cx="8.5" cy="7" r="4"></circle>
                 <line x1="20" y1="8" x2="20" y2="14"></line>
@@ -2616,71 +2649,27 @@
             </div>
             <div>
               <h3 class="modal-title">Incoming Connection Request</h3>
-              <p class="modal-subtitle">A remote device wants to connect to this computer</p>
+              <p class="modal-subtitle">A remote client wants to access this computer</p>
             </div>
           </div>
 
-          <div class="modal-details">
-            <div class="detail-row">
-              <span class="detail-key">Remote Peer ID:</span>
-              <span class="detail-val">{incomingRequest.client_peer_id}</span>
+          <div class="incoming-caller-box">
+            <div class="caller-item">
+              <span class="caller-key">Caller ID</span>
+              <span class="caller-id-number">{formatCallerId(incomingRequest.client_peer_id)}</span>
             </div>
-            <div class="detail-row">
-              <span class="detail-key">Remote IP Address:</span>
-              <span class="detail-val">{incomingRequest.client_ip}</span>
-            </div>
-          </div>
-
-          <div class="modal-permission-section">
-            <span class="section-label">GRANT PERMISSION LEVEL:</span>
-            <div class="perm-cards-list">
-              <button
-                type="button"
-                class="perm-choice-card"
-                class:selected={selectedIncomingPermission === "ViewOnly"}
-                onclick={() => (selectedIncomingPermission = "ViewOnly")}
-              >
-                <div class="choice-title">
-                  <span class="choice-icon">🔒</span>
-                  <span>Screen Share (View Only)</span>
-                </div>
-                <div class="choice-desc">Remote user can only watch your screen. Mouse clicks and typing are strictly blocked.</div>
-              </button>
-
-              <button
-                type="button"
-                class="perm-choice-card"
-                class:selected={selectedIncomingPermission === "Standard"}
-                onclick={() => (selectedIncomingPermission = "Standard")}
-              >
-                <div class="choice-title">
-                  <span class="choice-icon">⚡</span>
-                  <span>Standard (Default)</span>
-                </div>
-                <div class="choice-desc">Allows remote mouse clicks and keyboard typing for interactive assistance.</div>
-              </button>
-
-              <button
-                type="button"
-                class="perm-choice-card"
-                class:selected={selectedIncomingPermission === "FullAccess"}
-                onclick={() => (selectedIncomingPermission = "FullAccess")}
-              >
-                <div class="choice-title">
-                  <span class="choice-icon">🛡</span>
-                  <span>Full Access</span>
-                </div>
-                <div class="choice-desc">Complete unrestricted control of mouse, keyboard, and display switching.</div>
-              </button>
+            <div class="caller-item">
+              <span class="caller-key">Caller IP</span>
+              <span class="caller-ip-address">{incomingRequest.client_ip || "Direct Connection"}</span>
             </div>
           </div>
 
-          <div class="modal-actions">
-            <button class="btn-decline" onclick={declineIncomingConnection}>
+          <div class="modal-actions incoming-modal-actions">
+            <button type="button" class="btn-decline" onclick={declineIncomingConnection}>
               Decline
             </button>
-            <button class="btn-accept" onclick={acceptIncomingConnection}>
-              Accept & Start Sharing
+            <button type="button" class="btn-accept btn-accept-direct" onclick={acceptIncomingConnection}>
+              Accept
             </button>
           </div>
         </div>
@@ -4495,15 +4484,6 @@
     font-size: 0.8rem;
     color: #94a3b8;
   }
-  .modal-details {
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    border-radius: 8px;
-    padding: 12px 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
   .detail-row {
     display: flex;
     justify-content: space-between;
@@ -4517,49 +4497,87 @@
     font-weight: 600;
     color: #f1f5f9;
   }
-  .modal-permission-section {
+  /* AnyDesk-Style Incoming Connection Prompt */
+  .incoming-modal-card {
+    max-width: 440px;
+    background: #0d1527;
+    border: 1px solid rgba(56, 189, 248, 0.28);
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.75), 0 0 25px rgba(56, 189, 248, 0.12);
+    border-radius: 16px;
+    padding: 24px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 20px;
   }
-  .perm-cards-list {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .perm-choice-card {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 8px;
-    padding: 12px 14px;
-    text-align: left;
-    cursor: pointer;
-    transition: all 0.15s ease;
-  }
-  .perm-choice-card:hover {
-    background: rgba(255, 255, 255, 0.08);
-  }
-  .perm-choice-card.selected {
+  .incoming-badge-icon {
+    width: 46px;
+    height: 46px;
+    border-radius: 12px;
     background: rgba(56, 189, 248, 0.15);
-    border-color: #38bdf8;
-    box-shadow: 0 0 10px rgba(56, 189, 248, 0.2);
-  }
-  .choice-title {
+    color: #38bdf8;
     display: flex;
     align-items: center;
-    gap: 8px;
-    font-weight: 700;
-    font-size: 0.88rem;
-    color: #f1f5f9;
+    justify-content: center;
+    flex-shrink: 0;
   }
-  .choice-icon {
-    font-size: 1rem;
+  .incoming-caller-box {
+    background: rgba(15, 23, 42, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
   }
-  .choice-desc {
-    margin-top: 4px;
-    font-size: 0.76rem;
+  .caller-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .caller-key {
+    font-size: 0.82rem;
+    font-weight: 500;
     color: #94a3b8;
-    line-height: 1.3;
+    letter-spacing: 0.3px;
+  }
+  .caller-id-number {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 1.15rem;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.1);
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    padding: 4px 10px;
+    border-radius: 6px;
+  }
+  .caller-ip-address {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: #e2e8f0;
+  }
+  .incoming-modal-actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 4px;
+  }
+  .btn-accept-direct {
+    flex: 1;
+    background: #0284c7;
+    border: 1px solid #38bdf8;
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 0.95rem;
+    padding: 12px;
+    border-radius: 10px;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4);
+    transition: all 0.15s ease;
+  }
+  .btn-accept-direct:hover {
+    background: #0369a1;
+    box-shadow: 0 6px 18px rgba(2, 132, 199, 0.55);
   }
   .modal-actions {
     display: flex;

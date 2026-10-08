@@ -692,6 +692,10 @@ async fn respond_connection_request(
     if let Some(tx) = sender {
         let _ = tx.send((accept, access_level));
         if accept {
+            let host_guard = state.host.lock().await;
+            if let Some(ref host) = *host_guard {
+                host.host_net.set_access_level(access_level);
+            }
             if let Some(app) = state.app_handle.lock().as_ref() {
                 let _ = app.emit("session-status-changed", ());
             }

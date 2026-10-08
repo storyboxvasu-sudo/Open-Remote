@@ -140,7 +140,7 @@ jobs:
           $tauriConfPath = Join-Path $workspace "app-ui/src-tauri/tauri.conf.json"
           $appVersion = (Get-Content $tauriConfPath -Raw | ConvertFrom-Json).version
           if (-not $appVersion) {
-            $appVersion = "1.0.26"
+            $appVersion = "1.0.27"
           }
           Write-Host "Signing updater archive with explicit app-version: $appVersion"
 
