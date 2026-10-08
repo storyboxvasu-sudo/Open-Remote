@@ -111,7 +111,7 @@ jobs:
             if ($nsisSig) {
               Copy-Item $nsisSig.FullName $nsisSigPath -Force
               Write-Host "Collected NSIS Signature: $nsisSigPath"
-            } elseif (Test-Path "$($nsisZip.FullName).sig") {
+            } elseif ((Test-Path "$($nsisZip.FullName).sig")) {
               Copy-Item "$($nsisZip.FullName).sig" $nsisSigPath -Force
               Write-Host "Collected NSIS Signature: $nsisSigPath"
             }
@@ -124,8 +124,12 @@ jobs:
           }
 
           # Verify that OpenRemote-Windows-x64.nsis.zip is created successfully before running tauri signer sign
-          if (-not (Test-Path $nsisZipPath) -or ((Get-Item $nsisZipPath).Length -eq 0)) {
+          if (-not (Test-Path $nsisZipPath)) {
             Write-Error "Failed to locate or generate updater archive at $nsisZipPath!"
+            exit 1
+          }
+          if ((Get-Item $nsisZipPath).Length -eq 0) {
+            Write-Error "Updater archive at $nsisZipPath is empty (0 bytes)!"
             exit 1
           }
           Write-Host "Verified updater archive exists at: $nsisZipPath ($((Get-Item $nsisZipPath).Length) bytes)"
@@ -139,7 +143,7 @@ jobs:
           Write-Host "Signing updater archive with explicit app-version: $appVersion"
 
           # If signature file is missing, generate it via tauri signer sign with absolute path and explicit app-version
-          if (-not (Test-Path $nsisSigPath) -or ((Get-Item $nsisSigPath).Length -eq 0)) {
+          if ((-not (Test-Path $nsisSigPath)) -or ((Get-Item $nsisSigPath).Length -eq 0)) {
             if ($env:TAURI_SIGNING_PRIVATE_KEY) {
               Write-Host "Signing $nsisZipPath using tauri signer..."
               pnpm --dir app-ui tauri signer sign --app-version $appVersion "$nsisZipPath"
@@ -149,15 +153,15 @@ jobs:
           }
 
           # Verify artifact signature generation: ensure .sig exists and is placed alongside .nsis.zip
-          if (-not (Test-Path $nsisSigPath) -or ((Get-Item $nsisSigPath).Length -eq 0)) {
+          if ((-not (Test-Path $nsisSigPath)) -or ((Get-Item $nsisSigPath).Length -eq 0)) {
             # Check if tauri signer placed it in app-ui/artifacts
             $fallbackSig = Join-Path $workspace "app-ui/artifacts/OpenRemote-Windows-x64.nsis.zip.sig"
-            if (Test-Path $fallbackSig) {
+            if ((Test-Path $fallbackSig)) {
               Copy-Item $fallbackSig $nsisSigPath -Force
             }
           }
 
-          if (Test-Path $nsisSigPath -and ((Get-Item $nsisSigPath).Length -gt 0)) {
+          if ((Test-Path $nsisSigPath) -and ((Get-Item $nsisSigPath).Length -gt 0)) {
             Write-Host "Windows updater signature verified at: $nsisSigPath"
             Write-Host "Signature content preview:"
             Get-Content $nsisSigPath
